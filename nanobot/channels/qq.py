@@ -151,6 +151,7 @@ class QQChannel(BaseChannel):
 
     name = "qq"
     display_name = "QQ"
+    send_tool_hints: bool = True  # Enable tool call notifications
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:

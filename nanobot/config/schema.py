@@ -245,6 +245,50 @@ class HeartbeatConfig(Base):
     keep_recent_messages: int = 8
 
 
+class EmbeddingConfig(Base):
+    """Embedding model configuration."""
+
+    provider: str = "modelscope"  # modelscope | local
+    model_name: str = "BAAI/bge-m3"
+    api_key: str = ""  # ModelScope API Key (optional for local mode)
+    base_url: str = "https://api-inference.modelscope.cn/v1"
+    device: str = "cpu"  # cpu | cuda | mps
+    dimensions: int = 1024  # bge-m3 output dimensions
+
+
+class RerankerConfig(Base):
+    """Reranker model configuration."""
+
+    enabled: bool = True
+    provider: str = "modelscope"  # modelscope | local
+    model_name: str = "BAAI/bge-reranker-v2-m3"
+    api_key: str = ""  # ModelScope API Key (optional for local mode)
+    top_k: int = 5  # Results to keep after reranking
+
+
+class RAGConfig(Base):
+    """RAG knowledge base configuration."""
+
+    enable: bool = False
+    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+    reranker: RerankerConfig = Field(default_factory=RerankerConfig)
+    vector_store_path: str = "data/vector_store"  # FAISS index storage path
+    chunk_size: int = 512  # Text chunk size (tokens)
+    chunk_overlap: int = 64  # Chunk overlap
+    top_k: int = 10  # Initial retrieval count
+    similarity_threshold: float = 0.3  # Similarity threshold
+    max_context_length: int = 4096  # Max RAG context length
+
+
+class MinerUConfig(Base):
+    """MinerU PDF parsing configuration."""
+
+    enable: bool = False
+    device: str = "cpu"  # cpu | cuda
+    formula_recognition: bool = True  # Formula recognition
+    table_recognition: bool = True  # Table recognition
+
+
 class ApiConfig(Base):
     """OpenAI-compatible API server configuration."""
 
@@ -297,6 +341,8 @@ class ToolsConfig(Base):
     image_generation: ImageGenerationToolConfig = Field(
         default_factory=lambda: _lazy_default("nanobot.agent.tools.image_generation", "ImageGenerationToolConfig"),
     )
+    rag: RAGConfig = Field(default_factory=RAGConfig)
+    mineru: MinerUConfig = Field(default_factory=MinerUConfig)
     restrict_to_workspace: bool = False  # policy intent: keep tool access inside workspace when possible
     webui_allow_local_service_access: bool = Field(
         default=True,

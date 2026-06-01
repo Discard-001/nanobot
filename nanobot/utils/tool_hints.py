@@ -18,6 +18,8 @@ _TOOL_FORMATS: dict[str, tuple[list[str], str, bool, bool]] = {
     "web_search": (["query"],                          'search "{}"', False, False),
     "web_fetch":  (["url"],                            "fetch {}",    True,  False),
     "list_dir":   (["path"],                           "ls {}",       True,  False),
+    "rag":        (["query", "path"],                  "rag {}",      False, False),
+    "literature_search": (["query"],                   'papers "{}"', False, False),
 }
 
 # Matches file paths embedded in shell commands, including quoted paths with spaces.

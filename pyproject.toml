@@ -95,6 +95,13 @@ langsmith = [
 pdf = [
     "pymupdf>=1.25.0",
 ]
+rag = [
+    "faiss-cpu>=1.7.0",
+    "sentence-transformers>=2.2.0",
+]
+mineru = [
+    "magic-pdf[full]>=0.7.0",
+]
 olostep = [
     "olostep>=0.1.0",
 ]

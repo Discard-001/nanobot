@@ -472,6 +472,14 @@ class AgentLoop:
         from nanobot.agent.tools.context import ToolContext
         from nanobot.agent.tools.loader import ToolLoader
 
+        # Initialize RAG pipeline if enabled
+        rag_pipeline = None
+        if self.tools_config.rag.enable:
+            try:
+                rag_pipeline = self._create_rag_pipeline()
+            except Exception as e:
+                logger.warning("Failed to initialize RAG pipeline: {}", e)
+
         ctx = ToolContext(
             config=self.tools_config,
             workspace=str(self.workspace),
@@ -483,6 +491,7 @@ class AgentLoop:
             image_generation_provider_configs=self._image_generation_provider_configs,
             timezone=self.context.timezone or "UTC",
             workspace_sandbox=self.workspace_scopes.sandbox_status,
+            rag_pipeline=rag_pipeline,
         )
         loader = ToolLoader()
         registered = loader.load(ctx, self.tools)
@@ -495,6 +504,83 @@ class AgentLoop:
             registered.append("my")
 
         logger.info("Registered {} tools: {}", len(registered), registered)
+
+    def _create_rag_pipeline(self):
+        """Create and initialize RAG pipeline from config.
+
+        Returns:
+            Initialized RAGPipeline instance.
+
+        Raises:
+            ImportError: If required dependencies are not installed.
+            Exception: If initialization fails.
+        """
+        from nanobot.rag.embedding import EmbeddingService
+        from nanobot.rag.pipeline import RAGPipeline
+        from nanobot.rag.reranker import RerankerService
+        from nanobot.rag.vector_store import FAISSVectorStore
+
+        rag_config = self.tools_config.rag
+
+        # Create embedding service
+        embedding_service = EmbeddingService(
+            provider=rag_config.embedding.provider,
+            model_name=rag_config.embedding.model_name,
+            api_key=rag_config.embedding.api_key,
+            base_url=rag_config.embedding.base_url,
+            device=rag_config.embedding.device,
+            dimensions=rag_config.embedding.dimensions,
+        )
+
+        # Create reranker service
+        reranker_service = RerankerService(
+            provider=rag_config.reranker.provider,
+            model_name=rag_config.reranker.model_name,
+            api_key=rag_config.reranker.api_key,
+            top_k=rag_config.reranker.top_k,
+        )
+
+        # Create vector store
+        store_path = self.workspace / rag_config.vector_store_path
+        vector_store = FAISSVectorStore(
+            store_path=store_path,
+            dimensions=rag_config.embedding.dimensions,
+        )
+
+        # Create MinerU parser if enabled
+        mineru_parser = None
+        if self.tools_config.mineru.enable:
+            try:
+                from nanobot.utils.mineru_parser import MinerUParser
+                mineru_parser = MinerUParser(
+                    device=self.tools_config.mineru.device,
+                    formula_recognition=self.tools_config.mineru.formula_recognition,
+                    table_recognition=self.tools_config.mineru.table_recognition,
+                )
+            except ImportError as e:
+                logger.warning("MinerU not available: {}", e)
+
+        # Create pipeline
+        pipeline = RAGPipeline(
+            embedding_service=embedding_service,
+            reranker_service=reranker_service,
+            vector_store=vector_store,
+            chunk_size=rag_config.chunk_size,
+            chunk_overlap=rag_config.chunk_overlap,
+            top_k=rag_config.top_k,
+            similarity_threshold=rag_config.similarity_threshold,
+            max_context_length=rag_config.max_context_length,
+            mineru_parser=mineru_parser,
+        )
+
+        logger.info(
+            "RAG pipeline created: embedding={}, reranker={}, store={}",
+            rag_config.embedding.model_name,
+            rag_config.reranker.model_name,
+            store_path,
+        )
+
+        return pipeline
 
     async def _connect_mcp(self) -> None:
         """Connect configured MCP servers."""
