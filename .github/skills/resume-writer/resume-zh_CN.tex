@@ -75,7 +75,7 @@
 \role{Python 3.12, HKUDS/nanobot, AI Agent, Tool Calling, MCP, asyncio}{独立研究 / 核心开发}
 \begin{itemize}
   \item \textbf{项目简介}：为满足个人日程管理、消息提醒及文献处理等多样化需求，基于 Nanobot 框架进行源码级二次开发，构建了一个可长期运行、支持多任务切换以及具备长期记忆与角色成长性的 QQ 智能个人助理。
-  \item \textbf{三级记忆架构实现 Agent 成长性}:使用 MEMORY.md（长期注入 System Prompt）、HISTORY.md（按需检索）和 Session JSONL 三层体系，使 Agent 能从交互中持续学习用户偏好，越用越好用。
+  \item \textbf{三级记忆架构实现 Agent 成长性}:使用 MEMORY.md（长期注入 System Prompt）、HISTORY.jsonl（按需检索）和 Session JSONL 三层体系，使 Agent 能从交互中持续学习用户偏好，越用越好用。
   \item \textbf{多会话管理与上下文切换}: 针对原生 ReAct 上下文持续堆叠导致的注意力稀释与错误关联问题，实现了多会话隔离机制，为不同任务维护独立上下文，支持实时切换，保障 Agent 专注力。
   \item \textbf{ReAct 链路优化与工具调用透明化: }打通\textbf{日程管理}（创建/查询/提醒）和文献检索工具链，并\textbf{实现实时工具调用通知}，将 Agent 的内隐思考外显化，让行为路径透明、可解释。
   \item \textbf{RAG 增强的PDF问答}：接入 MinerU 实现论文 PDF 结构化解析（含公式等），结合向量检索（FAISS）构建知识库，完成“检索 → 解析 → 总结”端到端链路，解决长文档截断与幻觉问题。
