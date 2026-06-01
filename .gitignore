@@ -2,6 +2,7 @@
 .worktrees/
 .worktree/
 my-agent/
+.github/skills/
 .assets
 .docs
 .env
