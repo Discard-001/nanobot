@@ -1,0 +1,114 @@
+% !TEX TS-program = xelatex
+% !TEX encoding = UTF-8 Unicode
+% !Mode:: "TeX:UTF-8"
+
+\documentclass{resume}
+\usepackage{zh_CN-Adobefonts_external} % Simplified Chinese Support using external fonts (./fonts/zh_CN-Adobe/)
+% \usepackage{NotoSansSC_external}
+% \usepackage{NotoSerifCJKsc_external}
+% \usepackage{zh_CN-Adobefonts_internal} % Simplified Chinese Support using system fonts
+\usepackage{linespacing_fix} % disable extra space before next section
+\usepackage{cite}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{graphicx}
+\usepackage{calc}
+\usepackage[most]{tcolorbox}
+
+\newcommand{\schooltag}[1]{%
+  \tcbox[
+    on line,
+    boxsep=1.2pt,
+    left=2pt,
+    right=2pt,
+    top=1pt,
+    bottom=1pt,
+    colback=cyan!12,
+    colframe=cyan!12,
+    arc=2pt,
+    boxrule=0pt
+  ]{\textcolor{cyan!80}{\sffamily\normalsize #1}}\hspace{4pt}%
+}
+
+% Avoid hyperref bookmark warnings when \schooltag appears in section titles.
+\pdfstringdefDisableCommands{%
+  \def\schooltag#1{}%
+}
+
+\begin{document}
+\pagenumbering{gobble} % suppress displaying page number
+
+%左上角放置学校 logo
+\noindent\makebox[0pt][l]{%
+  \raisebox{-0.4\height}[0pt][0pt]{%
+    \includegraphics[width=0.28\textwidth]{hit-logo.png}%
+  }%
+}%
+
+% 右上角放置照片
+\noindent\hfill\raisebox{-0.6\height}[0pt][0pt]{%
+  \includegraphics[width=0.95in]{resume/freecompress-证件照（蓝）.jpg}%
+}\par\vspace{-1.4em}
+
+\name{侯金科}
+
+\basicInfo{
+  \phone{187-3619-1305}｜
+  \email{2901779563@qq.com}
+}\vspace{-0.3em}
+ 
+\section{\faGraduationCap\ 教育背景}
+\datedsubsection{\textbf{哈尔滨工业大学} \quad 电子信息 （硕士在读）\schooltag{985}\schooltag{211}\schooltag{双一流}}{2025.09 -- 至今}
+\datedsubsection{\textbf{郑州大学} \quad 物联网工程 （本科） \schooltag{211}\schooltag{双一流}}{2021.09 -- 2025.06}
+\textit{英语：CET-6}\quad\textit{GPA：3.63/4.00}\quad\textit{专业排名: 24/143}
+
+\section{\faUsers\ 实习/项目经历}
+\datedsubsection{\textbf{基于 Llama3 的轻量级大语言模型训练与对齐系统}}{2025.12 -- 2026.02}
+\role{Python, PyTorch, Transformer, LoRA, DPO/GRPO}{个人项目}
+\begin{itemize}
+  \item \textbf{项目简介}：面向轻量级大语言模型训练场景，独立完成从模型搭建、预训练、指令微调到偏好对齐的完整实验流程，系统复现并实践小规模 LLM 训练与后训练核心方法。
+  \item \textbf{从 0 搭建轻量级大语言模型}：基于 Decoder-only 架构实现轻量模型，完成 RoPE 位置编码、KV Cache、GQA 注意力、RMSNorm 等核心模块开发，为后续训练与对齐提供统一模型底座。
+  \item \textbf{完成预训练与微调全流程}：基于 PyTorch 搭建预训练、SFT 和 LoRA 微调代码，支持混合精度、梯度累积；结合对话模板与 loss mask 设计，减少无效监督信号干扰，提升训练稳定性。
+  \item \textbf{实现模型后训练与偏好对齐}：基于偏好数据实现 DPO、GRPO 等后训练方法，结合规则奖励与推理格式约束，提升回答一致性与推理结果的格式稳定性。
+\end{itemize}
+
+\datedsubsection{\textbf{基于Nanobot的QQ智能个人助理}}{2026.02 -- 2026.04}
+\role{Python 3.12, HKUDS/nanobot, AI Agent, Tool Calling, MCP, asyncio}{独立研究 / 核心开发}
+\begin{itemize}
+  \item \textbf{项目简介}：为满足个人日程管理、消息提醒及文献处理等多样化需求，基于 Nanobot 框架进行源码级二次开发，构建了一个可长期运行、支持多任务切换以及具备长期记忆与角色成长性的 QQ 智能个人助理。
+  \item \textbf{三级记忆架构实现 Agent 成长性}:使用 MEMORY.md（长期注入 System Prompt）、HISTORY.md（按需检索）和 Session JSONL 三层体系，使 Agent 能从交互中持续学习用户偏好，越用越好用。
+  \item \textbf{多会话管理与上下文切换}: 针对原生 ReAct 上下文持续堆叠导致的注意力稀释与错误关联问题，实现了多会话隔离机制，为不同任务维护独立上下文，支持实时切换，保障 Agent 专注力。
+  \item \textbf{ReAct 链路优化与工具调用透明化: }打通\textbf{日程管理}（创建/查询/提醒）和文献检索工具链，并\textbf{实现实时工具调用通知}，将 Agent 的内隐思考外显化，让行为路径透明、可解释。
+  \item \textbf{RAG 增强的PDF问答}：接入 MinerU 实现论文 PDF 结构化解析（含公式等），结合向量检索（FAISS）构建知识库，完成“检索 → 解析 → 总结”端到端链路，解决长文档截断与幻觉问题。
+\end{itemize}
+
+% Reference Test
+%\datedsubsection{\textbf{Paper Title\cite{zaharia2012resilient}}}{May. 2015}
+%An xxx optimized for xxx\cite{verma2015large}
+%\begin{itemize}
+%  \item main contribution
+%\end{itemize}
+
+\section{\faCogs\ 专业技能}
+\begin{itemize}[parsep=0.3ex, leftmargin=*]
+  \item \textbf{编程语言：}Python, C++, Java
+  \item \textbf{深度学习：}PyTorch, Transformer, LoRA/PEFT, 模型训练与对齐(DPO/GRPO）
+  \item \textbf{AI 应用：}RAG, Agent (ReAct), Prompt Engineering, MCP
+  \item \textbf{工程与部署：}Linux, Git, Conda, uv, FastAPI （基础）
+  
+\end{itemize}
+
+\section{\faHeartO\ 获奖情况}
+\datedline{全国大学生物联网设计竞赛（华为杯）西北赛区一等奖、全国总决赛三等奖}{2023}
+\datedline{蓝桥杯全国软件和信息技术专业人才大赛河南赛区 C/C++ 程序设计大学 A 组二等奖}{2023}
+% \datedline{网络技术挑战赛华中赛区三等奖}{2023、2024}
+\datedline{郑州大学优秀学生奖学金二等奖（3 次）}{2022、2023、2024}
+\datedline{计算机软件著作权 2 项}{2024}
+% \datedline{郑州大学 2022--2023 学年三好学生}{2023}
+
+
+
+%% Reference
+%\newpage
+%\bibliographystyle{IEEETran}
+%\bibliography{mycite}
+\end{document}
