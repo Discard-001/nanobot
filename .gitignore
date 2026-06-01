@@ -1,6 +1,7 @@
 # Project-specific
 .worktrees/
 .worktree/
+my-agent/
 .assets
 .docs
 .env
