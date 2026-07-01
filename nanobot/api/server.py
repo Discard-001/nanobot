@@ -7,15 +7,18 @@ All requests route to a single persistent API session.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json as _json
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
 from loguru import logger
 
+from nanobot.agent.tools.image_generation import ImageGenerationTool
 from nanobot.config.paths import get_media_dir
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.media_decode import (
@@ -35,6 +38,8 @@ __all__ = (
     "_save_base64_data_url",
     "create_app",
     "handle_chat_completions",
+    "handle_image_generate",
+    "handle_images_generations",
 )
 
 
@@ -78,6 +83,135 @@ def _response_text(value: Any) -> str:
     if hasattr(value, "content"):
         return str(getattr(value, "content") or "")
     return str(value)
+
+
+# ---------------------------------------------------------------------------
+# Image generation helpers
+# ---------------------------------------------------------------------------
+
+
+def _image_generation_config(agent_loop: Any) -> Any:
+    tools_config = getattr(agent_loop, "tools_config", None)
+    config = getattr(tools_config, "image_generation", None)
+    if config is None or not getattr(config, "enabled", False):
+        raise ValueError("Image generation is not enabled")
+    return config
+
+
+def _image_generation_tool(agent_loop: Any, config: Any) -> ImageGenerationTool:
+    return ImageGenerationTool(
+        workspace=getattr(agent_loop, "workspace", "."),
+        config=config,
+        provider_configs=getattr(agent_loop, "_image_generation_provider_configs", {}),
+    )
+
+
+def _required_prompt(body: dict[str, Any]) -> str:
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("'prompt' must be a non-empty string")
+    return prompt
+
+
+def _positive_int(body: dict[str, Any], field: str, default: int) -> int:
+    value = body.get(field, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"'{field}' must be a positive integer")
+    return value
+
+
+def _validate_image_model(body: dict[str, Any], configured_model: str) -> None:
+    requested_model = body.get("model")
+    if requested_model and requested_model != configured_model:
+        raise ValueError(f"Only configured image model '{configured_model}' is available")
+
+
+def _validate_image_count(count: int, max_count: int) -> None:
+    if count > max_count:
+        raise ValueError(f"count exceeds tools.imageGeneration.maxImagesPerTurn ({max_count})")
+
+
+async def _parse_json_body(request: web.Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise ValueError("Invalid JSON body") from exc
+    if not isinstance(body, dict):
+        raise ValueError("JSON body must be an object")
+    return body
+
+
+async def _run_image_generation(
+    *,
+    request: web.Request,
+    prompt: str,
+    count: int,
+    aspect_ratio: str | None = None,
+    image_size: str | None = None,
+    reference_images: list[str] | None = None,
+) -> tuple[dict[str, Any] | None, web.Response | None]:
+    agent_loop = request.app["agent_loop"]
+    timeout_s: float = request.app.get("request_timeout", 120.0)
+
+    try:
+        config = _image_generation_config(agent_loop)
+        _validate_image_count(count, getattr(config, "max_images_per_turn", 1))
+        tool = _image_generation_tool(agent_loop, config)
+        result_text = await asyncio.wait_for(
+            tool.execute(
+                prompt=prompt,
+                reference_images=reference_images,
+                aspect_ratio=aspect_ratio,
+                image_size=image_size,
+                count=count,
+            ),
+            timeout=timeout_s,
+        )
+    except ValueError as exc:
+        return None, _error_json(400, str(exc))
+    except asyncio.TimeoutError:
+        return None, _error_json(504, f"Request timed out after {timeout_s}s")
+    except Exception:
+        logger.exception("Error processing image generation request")
+        return None, _error_json(500, "Internal server error", err_type="server_error")
+
+    if result_text.startswith("Error:"):
+        return None, _error_json(400, result_text.removeprefix("Error:").strip())
+
+    try:
+        result = _json.loads(result_text)
+    except Exception:
+        logger.error("Image generation tool returned invalid JSON: {}", result_text[:500])
+        return None, _error_json(500, "Image generation returned invalid data", "server_error")
+    if not isinstance(result, dict):
+        return None, _error_json(500, "Image generation returned invalid data", "server_error")
+    return result, None
+
+
+def _artifact_b64_json(artifact: dict[str, Any]) -> str:
+    path = artifact.get("path")
+    if not isinstance(path, str) or not path:
+        raise ValueError("generated image artifact is missing a path")
+    raw = Path(path).read_bytes()
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _optional_string(body: dict[str, Any], field: str) -> str | None:
+    value = body.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"'{field}' must be a non-empty string")
+    return value
+
+
+def _optional_reference_images(body: dict[str, Any]) -> list[str] | None:
+    value = body.get("reference_images")
+    if value is None:
+        return None
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError("'reference_images' must be a list of strings")
+    return value
 
 # ---------------------------------------------------------------------------
 # SSE helpers
@@ -349,6 +483,74 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     return web.json_response(_chat_completion_response(response_text, model_name))
 
 
+async def handle_images_generations(request: web.Request) -> web.Response:
+    """POST /v1/images/generations — OpenAI-compatible image generation."""
+    try:
+        body = await _parse_json_body(request)
+        agent_loop = request.app["agent_loop"]
+        config = _image_generation_config(agent_loop)
+        _validate_image_model(body, getattr(config, "model", ""))
+
+        prompt = _required_prompt(body)
+        count = _positive_int(body, "n", 1)
+        _validate_image_count(count, getattr(config, "max_images_per_turn", 1))
+        image_size = _optional_string(body, "size")
+        response_format = body.get("response_format", "b64_json")
+        if response_format != "b64_json":
+            return _error_json(400, "Only response_format 'b64_json' is supported")
+    except ValueError as exc:
+        return _error_json(400, str(exc))
+
+    result, error = await _run_image_generation(
+        request=request,
+        prompt=prompt,
+        count=count,
+        image_size=image_size,
+    )
+    if error is not None:
+        return error
+
+    try:
+        artifacts = result.get("artifacts", []) if result is not None else []
+        data = [{"b64_json": _artifact_b64_json(artifact)} for artifact in artifacts]
+    except (OSError, ValueError):
+        logger.exception("Error reading generated image artifact")
+        return _error_json(500, "Generated image artifact could not be read", "server_error")
+
+    return web.json_response({"created": int(time.time()), "data": data})
+
+
+async def handle_image_generate(request: web.Request) -> web.Response:
+    """POST /v1/image/generate — nanobot-native image generation."""
+    try:
+        body = await _parse_json_body(request)
+        agent_loop = request.app["agent_loop"]
+        config = _image_generation_config(agent_loop)
+        _validate_image_model(body, getattr(config, "model", ""))
+
+        prompt = _required_prompt(body)
+        count = _positive_int(body, "count", 1)
+        _validate_image_count(count, getattr(config, "max_images_per_turn", 1))
+        aspect_ratio = _optional_string(body, "aspect_ratio")
+        image_size = _optional_string(body, "image_size")
+        reference_images = _optional_reference_images(body)
+    except ValueError as exc:
+        return _error_json(400, str(exc))
+
+    result, error = await _run_image_generation(
+        request=request,
+        prompt=prompt,
+        count=count,
+        aspect_ratio=aspect_ratio,
+        image_size=image_size,
+        reference_images=reference_images,
+    )
+    if error is not None:
+        return error
+
+    return web.json_response(result)
+
+
 async def handle_models(request: web.Request) -> web.Response:
     """GET /v1/models"""
     model_name = request.app.get("model_name", "nanobot")
@@ -394,6 +596,8 @@ def create_app(
     app["session_locks"] = {}  # per-user locks, keyed by session_key
 
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
+    app.router.add_post("/v1/images/generations", handle_images_generations)
+    app.router.add_post("/v1/image/generate", handle_image_generate)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/health", handle_health)
     return app
