@@ -291,7 +291,7 @@ class MinerUConfig(Base):
         default="vlm",
         validation_alias=AliasChoices("modelVersion", "model_version"),
     )
-    language: str = "ch"  # Document language hint
+    language: str = ""  # Optional hint ("ch"/"en"/...); empty = auto-detect
     formula_recognition: bool = True  # Formula recognition
     table_recognition: bool = True  # Table recognition
 

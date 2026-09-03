@@ -74,7 +74,7 @@ class MinerUApiParser:
         self,
         api_token: str,
         model_version: str = "vlm",
-        language: str = "ch",
+        language: str = "",  # empty = let MinerU auto-detect; hint like "ch"/"en"
         formula_recognition: bool = True,
         table_recognition: bool = True,
         api_base: str | None = None,
@@ -112,16 +112,19 @@ class MinerUApiParser:
 
         async with httpx.AsyncClient(timeout=120.0) as client:
             # 1. Request a signed upload URL (batch API accepts a single file too)
+            payload: dict[str, Any] = {
+                "files": [{"name": file_path.name, "data_id": file_path.stem}],
+                "model_version": self.model_version,
+                "enable_formula": self.formula_recognition,
+                "enable_table": self.table_recognition,
+            }
+            if self.language:
+                # Optional hint; omit to let MinerU auto-detect the document language
+                payload["language"] = self.language
             create_resp = await client.post(
                 f"{self.api_base}/file-urls/batch",
                 headers=self._headers,
-                json={
-                    "files": [{"name": file_path.name, "data_id": file_path.stem}],
-                    "model_version": self.model_version,
-                    "enable_formula": self.formula_recognition,
-                    "enable_table": self.table_recognition,
-                    "language": self.language,
-                },
+                json=payload,
             )
             create_data = self._unwrap(create_resp)
             batch_id = create_data.get("batch_id")

@@ -63,7 +63,11 @@ class TestUnwrap:
 
 class TestParseFlow:
     def _make_parser(self, **kw) -> MinerUApiParser:
-        return MinerUApiParser(api_token="tok", poll_interval=0, **kw)
+        # NB: poll_interval=0 would fall back to the 5s default (falsy),
+        # so use a tiny positive interval; keep the timeout comfortably
+        # above it for multi-poll flows.
+        kw.setdefault("poll_timeout", 30.0)
+        return MinerUApiParser(api_token="tok", poll_interval=0.01, **kw)
 
     async def test_full_flow_returns_markdown(self, tmp_path):
         pdf = tmp_path / "paper.pdf"
@@ -110,8 +114,39 @@ class TestParseFlow:
         assert create_call.args[0] == "https://mineru.net/api/v4/file-urls/batch"
         assert create_call.kwargs["json"]["model_version"] == "vlm"
         assert create_call.kwargs["json"]["enable_formula"] is True
+        # No language hint by default -> auto-detect on the MinerU side
+        assert "language" not in create_call.kwargs["json"]
         put_call = client.put.call_args
         assert put_call.args[0] == "https://oss/upload"
+
+    async def test_language_hint_sent_when_configured(self, tmp_path):
+        pdf = tmp_path / "paper.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+        parser = self._make_parser(language="en", poll_timeout=0.05)
+
+        create_resp = _json_response(
+            {"code": 0, "data": {"batch_id": "b1", "file_urls": ["https://oss/upload"]}}
+        )
+        client = MagicMock()
+        client.post = AsyncMock(return_value=create_resp)
+        client.put = AsyncMock(return_value=httpx.Response(
+            200, request=httpx.Request("PUT", "https://oss/upload")
+        ))
+        # Poll always running -> flow times out quickly, but payload is captured
+        client.get = AsyncMock(return_value=_json_response(
+            {"code": 0, "data": {"extract_result": [{"state": "running"}]}}
+        ))
+
+        original_async_client = httpx.AsyncClient
+        httpx.AsyncClient = lambda **kw: _AsyncClientStub(client)
+        try:
+            with pytest.raises(RuntimeError, match="timed out"):
+                await parser.parse(pdf)
+        finally:
+            httpx.AsyncClient = original_async_client
+
+        json_payload = client.post.call_args.kwargs["json"]
+        assert json_payload["language"] == "en"
 
     async def test_missing_file_raises(self, tmp_path):
         parser = self._make_parser()
