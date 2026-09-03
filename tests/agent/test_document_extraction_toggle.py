@@ -173,3 +173,79 @@ def test_document_extraction_disabled_still_preserves_images(tmp_path: Path) -> 
 
     assert media == [str(image_path)]
     assert f"[Attachment: {doc_path}]" in content
+
+
+@pytest.mark.asyncio
+async def test_state_restore_publishes_parse_progress_for_documents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Document media emits a tool-hint style progress event before parsing."""
+    loop = _make_loop(tmp_path)
+    doc_path = tmp_path / "report.pdf"
+    doc_path.write_bytes(b"%PDF-1.4 minimal")
+
+    async def fake_extract_documents(
+        content: str, media: list[str], *, pdf_parser=None
+    ) -> tuple[str, list[str]]:
+        return f"{content}\n\n[File: report.pdf]\nparsed body", []
+
+    monkeypatch.setattr("nanobot.agent.loop.extract_documents_async", fake_extract_documents)
+
+    on_progress = AsyncMock()
+    ctx = TurnContext(
+        msg=InboundMessage(
+            channel="feishu",
+            sender_id="u",
+            chat_id="c",
+            content="",
+            media=[str(doc_path)],
+        ),
+        session_key="feishu:c",
+        state=TurnState.RESTORE,
+        turn_id="turn-1",
+        on_progress=on_progress,
+    )
+
+    assert await loop._state_restore(ctx) == "ok"
+
+    on_progress.assert_awaited_once()
+    args, kwargs = on_progress.await_args
+    assert args[0] == "解析文件 report.pdf"
+    assert kwargs.get("tool_hint") is True
+
+
+@pytest.mark.asyncio
+async def test_state_restore_skips_progress_for_images_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Image-only media must not emit a parse progress event."""
+    loop = _make_loop(tmp_path)
+    image_path = tmp_path / "chart.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    async def fake_extract_documents(
+        content: str, media: list[str], *, pdf_parser=None
+    ) -> tuple[str, list[str]]:
+        return content, media
+
+    monkeypatch.setattr("nanobot.agent.loop.extract_documents_async", fake_extract_documents)
+
+    on_progress = AsyncMock()
+    ctx = TurnContext(
+        msg=InboundMessage(
+            channel="feishu",
+            sender_id="u",
+            chat_id="c",
+            content="look",
+            media=[str(image_path)],
+        ),
+        session_key="feishu:c",
+        state=TurnState.RESTORE,
+        turn_id="turn-2",
+        on_progress=on_progress,
+    )
+
+    assert await loop._state_restore(ctx) == "ok"
+    on_progress.assert_not_awaited()

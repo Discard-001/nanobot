@@ -429,8 +429,9 @@ class TestToolHintInlineStreaming:
 
     @pytest.mark.asyncio
     async def test_tool_hint_fallback_when_no_stream(self):
-        """Without an active buffer, tool hint falls back to a standalone card."""
+        """Panel off + no active buffer → standalone card message."""
         ch = _make_channel()
+        ch.config.show_process_panel = False
         ch._client.im.v1.message.create.return_value = _mock_send_response("om_hint")
 
         msg = OutboundMessage(
@@ -446,6 +447,7 @@ class TestToolHintInlineStreaming:
     @pytest.mark.asyncio
     async def test_tool_hint_group_uses_create_when_reply_disabled(self):
         ch = _make_channel(reply_to_message=False)
+        ch.config.show_process_panel = False
         ch._client.im.v1.message.create.return_value = _mock_send_response("om_hint")
 
         msg = OutboundMessage(
@@ -461,6 +463,7 @@ class TestToolHintInlineStreaming:
     @pytest.mark.asyncio
     async def test_tool_hint_keeps_existing_topic_when_reply_disabled(self):
         ch = _make_channel(reply_to_message=False)
+        ch.config.show_process_panel = False
         reply_resp = MagicMock()
         reply_resp.success.return_value = True
         ch._client.im.v1.message.reply.return_value = reply_resp
@@ -485,6 +488,7 @@ class TestToolHintInlineStreaming:
     @pytest.mark.asyncio
     async def test_tool_hint_group_replies_when_reply_enabled(self):
         ch = _make_channel(reply_to_message=True)
+        ch.config.show_process_panel = False
         reply_resp = MagicMock()
         reply_resp.success.return_value = True
         ch._client.im.v1.message.reply.return_value = reply_resp
@@ -820,6 +824,47 @@ class TestProcessPanel:
         assert buf.has_tool_element is True
         assert buf.tool_count == 1
         ch._client.cardkit.v1.card.create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_tool_hint_with_no_buf_creates_panel_card(self):
+        """First visible event is a tool call (model skipped reasoning): create the panel card."""
+        ch = _make_channel()
+        ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_p3")
+        ch._client.im.v1.message.create.return_value = _mock_send_response()
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        msg = OutboundMessage(
+            channel="feishu", chat_id="oc_chat1",
+            content="shell(cmd='ls')",
+            metadata={"_tool_hint": True, "message_id": "om_in_9"},
+        )
+        await ch.send(msg)
+
+        buf = ch._stream_bufs["om_in_9"]
+        assert buf is not None and buf.card_id == "card_p3"
+        assert buf.has_tool_element is True
+        assert "shell" in buf.tool_log
+
+    @pytest.mark.asyncio
+    async def test_reasoning_end_panel_pushes_full_trace(self):
+        """Burst-delivered reasoning deltas swallowed by the throttle must be
+        pushed in full by reasoning_end (panel mode)."""
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            reasoning="完整思考内容", card_id="card_1", sequence=2,
+            reasoning_open=True, has_reasoning_element=True,
+            has_tool_element=True, last_reasoning_edit=time.monotonic(),
+        )
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_reasoning_end("oc_chat1")
+
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.reasoning_open is False
+        update_req = ch._client.cardkit.v1.card_element.content.call_args[0][0]
+        assert update_req.element_id == "reasoning_md"
+        assert update_req.request_body.content == "完整思考内容"
+        assert buf.sequence == 3
 
     @pytest.mark.asyncio
     async def test_tool_hint_legacy_mode_inlines_into_text(self):

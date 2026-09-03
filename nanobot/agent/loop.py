@@ -1397,6 +1397,22 @@ class AgentLoop:
         msg = ctx.msg
 
         if msg.media:
+            # Document parsing (MinerU / text extraction) can take tens of
+            # seconds; surface it as a tool-hint style progress event so the
+            # user sees the agent is working before the first LLM token.
+            if self._should_extract_document_text():
+                doc_names = [
+                    Path(m).name for m in msg.media
+                    if isinstance(m, str)
+                    and m.lower().endswith((".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md"))
+                ]
+                if doc_names:
+                    if ctx.on_progress is None:
+                        ctx.on_progress = await self._build_bus_progress_callback(msg)
+                    if ctx.on_progress is not None:
+                        await ctx.on_progress(
+                            f"解析文件 {', '.join(doc_names)}", tool_hint=True,
+                        )
             new_content, image_only = await self._prepare_message_media(msg.content, msg.media)
             ctx.msg = dataclasses.replace(msg, content=new_content, media=image_only)
             msg = ctx.msg

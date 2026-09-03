@@ -1637,10 +1637,22 @@ class FeishuChannel(BaseChannel):
         buf.reasoning_open = False
         loop = asyncio.get_running_loop()
 
-        # Process-panel mode: the panel groups the trace visually and the
-        # collapsed summary header is applied when the whole turn finishes, so
-        # closing one reasoning pass needs no API call.
+        # Process-panel mode: gateways often deliver the whole reasoning trace
+        # as a burst of deltas inside the throttle window, so the live path may
+        # have pushed only the first chunk. Push the complete pass now — this
+        # is the last chance to render it before the turn continues.
         if buf.has_tool_element:
+            if buf.card_id and buf.reasoning:
+                buf.sequence += 1
+                await loop.run_in_executor(
+                    None,
+                    self._stream_update_text_sync,
+                    buf.card_id,
+                    _tail_text(buf.reasoning, _REASONING_TAIL_CHARS),
+                    buf.sequence,
+                    _REASONING_ELEMENT_ID,
+                )
+                buf.last_reasoning_edit = time.monotonic()
             return
 
         # Inline degradation path: reasoning was folded into the content text.
@@ -1884,9 +1896,14 @@ class FeishuChannel(BaseChannel):
                 if not hint:
                     return
                 buf = self._stream_bufs.get(self._stream_key(msg.chat_id, msg.metadata))
-                if buf is not None and (buf.has_tool_element or (
-                    buf.card_id is None and self.config.show_process_panel
-                )):
+                use_panel = self.config.show_process_panel
+                # Panel mode: no card yet (model skipped reasoning, or the
+                # tool hint is the first visible event of the turn) → create
+                # the panel card now so the hint shows immediately.
+                if use_panel and (buf is None or buf.card_id is None or buf.has_tool_element):
+                    if buf is None:
+                        buf = _FeishuStreamBuf()
+                        self._stream_bufs[self._stream_key(msg.chat_id, msg.metadata)] = buf
                     # Process-panel mode: append the hint to the tool log
                     # element inside the collapsible panel, keeping the
                     # answer text clean.
