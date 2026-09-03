@@ -1,22 +1,23 @@
 """MinerU structured PDF parser for academic papers.
 
-Uses MinerU (magic-pdf) for high-quality PDF parsing with:
+Uses the MinerU cloud API (mineru.net) for high-quality PDF parsing with:
 - Formula recognition (LaTeX)
-- Table recognition (HTML/Markdown)
+- Table recognition (Markdown)
 - Layout analysis
 - Reading order detection
 
-Requires: pip install nanobot-ai[mineru]
+Requires an API token from https://mineru.net/apiManage/token.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from loguru import logger
+import httpx
 
 
 @dataclass
@@ -39,163 +40,164 @@ class ParsedDocument:
         return self.table_count > 0
 
 
-class MinerUParser:
-    """MinerU structured PDF parser.
+def _count_pages(content: str) -> int:
+    """Count pages from markdown content."""
+    # MinerU typically marks pages with "--- Page N ---" or similar
+    import re
+    pages = re.findall(r"---\s*Page\s+(\d+)\s*---", content)
+    if pages:
+        return max(int(p) for p in pages)
+    # Fallback: estimate from content length
+    return max(1, len(content) // 3000)
 
-    Provides high-quality PDF parsing for academic papers with support for:
-    - Mathematical formula recognition (output as LaTeX)
-    - Table recognition (output as Markdown tables)
-    - Layout analysis and reading order detection
-    - Multi-column document support
 
-    Usage:
-        parser = MinerUParser(device="cpu")
-        result = await parser.parse("paper.pdf")
-        print(result.markdown_content)  # Full markdown with formulas and tables
+class MinerUApiParser:
+    """MinerU cloud API parser (mineru.net Precision Extract API).
+
+    Parses PDFs (and doc/ppt/images) via the hosted MinerU service, keeping
+    the same ``parse() -> ParsedDocument`` interface as the local
+    :class:`MinerUParser` so the RAG pipeline can use either transparently.
+
+    Requires an API token from https://mineru.net/apiManage/token.
+    Flow (batch single-file upload):
+        1. POST /file-urls/batch  -> signed upload URL + batch_id
+        2. PUT file bytes to the signed URL (no Content-Type header)
+        3. Poll GET /extract-results/batch/{batch_id} until state == done
+        4. Download full_zip_url, extract the largest *.md
     """
+
+    _DEFAULT_BASE = "https://mineru.net/api/v4"
+    _POLL_INTERVAL = 5.0  # seconds between status checks
+    _POLL_TIMEOUT = 600.0  # overall parsing budget in seconds
 
     def __init__(
         self,
-        device: str = "cpu",
+        api_token: str,
+        model_version: str = "vlm",
+        language: str = "ch",
         formula_recognition: bool = True,
         table_recognition: bool = True,
+        api_base: str | None = None,
+        poll_interval: float | None = None,
+        poll_timeout: float | None = None,
     ):
-        self.device = device
+        if not api_token:
+            raise ValueError("MinerU API token is required (get one at mineru.net/apiManage/token)")
+        self.api_token = api_token
+        self.model_version = model_version
+        self.language = language
         self.formula_recognition = formula_recognition
         self.table_recognition = table_recognition
-        self._pipeline = None
+        self.api_base = (api_base or self._DEFAULT_BASE).rstrip("/")
+        self.poll_interval = poll_interval or self._POLL_INTERVAL
+        self.poll_timeout = poll_timeout or self._POLL_TIMEOUT
 
-    def _ensure_pipeline(self):
-        """Lazy-load MinerU pipeline."""
-        if self._pipeline is not None:
-            return
-
-        try:
-            from magic_pdf.pipe.UNIPipe import UNIPipe
-            from magic_pdf.pipe.OCRPipe import OCRPipe
-            self._UNIPipe = UNIPipe
-            self._OCRPipe = OCRPipe
-            self._pipeline = True
-            logger.info("MinerU pipeline loaded successfully (device={})", self.device)
-        except ImportError as e:
-            raise ImportError(
-                "MinerU (magic-pdf) is not installed. "
-                "Install it with: pip install nanobot-ai[mineru]"
-            ) from e
+    @property
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_token}",
+        }
 
     async def parse(self, pdf_path: str | Path) -> ParsedDocument:
-        """Parse a PDF file and return structured content.
+        """Parse a local file via the MinerU cloud API."""
+        import io
+        import zipfile
 
-        Args:
-            pdf_path: Path to the PDF file.
+        import httpx
 
-        Returns:
-            ParsedDocument with markdown content, metadata, and statistics.
-        """
-        pdf_path = Path(pdf_path)
-        if not pdf_path.exists():
-            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+        file_path = Path(pdf_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
 
-        if not pdf_path.suffix.lower() == ".pdf":
-            raise ValueError(f"Not a PDF file: {pdf_path}")
-
-        self._ensure_pipeline()
-
-        # Run parsing in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._parse_sync, pdf_path, None)
-
-    async def parse_pages(
-        self, pdf_path: str | Path, pages: list[int]
-    ) -> ParsedDocument:
-        """Parse specific pages of a PDF file.
-
-        Args:
-            pdf_path: Path to the PDF file.
-            pages: List of page numbers (0-indexed).
-
-        Returns:
-            ParsedDocument with content from specified pages.
-        """
-        pdf_path = Path(pdf_path)
-        if not pdf_path.exists():
-            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-
-        self._ensure_pipeline()
-
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._parse_sync, pdf_path, pages)
-
-    def _parse_sync(self, pdf_path: Path, pages: list[int] | None) -> ParsedDocument:
-        """Synchronous PDF parsing (runs in thread pool)."""
-        import json
-
-        try:
-            # Read PDF bytes
-            pdf_bytes = pdf_path.read_bytes()
-
-            # Choose pipeline based on content type
-            # UNIPipe handles both text-based and scanned PDFs
-            pipe = self._UNIPipe(
-                pdf_bytes,
-                [],
-                str(pdf_path),
-                is_debug=False,
-            )
-
-            # Execute pipeline
-            pipe.pipe_classify()
-            pipe.pipe_analyze()
-            pipe.pipe_parse()
-
-            # Get results
-            md_content = pipe.pipe_mk_markdown(
-                str(pdf_path.parent),
-                drop_mode="none",
-            )
-
-            # Parse result
-            result = ParsedDocument(
-                markdown_content=md_content,
-                page_count=self._count_pages(md_content),
-                formula_count=md_content.count("$") // 2,  # Rough estimate
-                table_count=md_content.count("|---"),  # Table separator count
-                metadata={
-                    "source": str(pdf_path),
-                    "parser": "mineru",
-                    "device": self.device,
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            # 1. Request a signed upload URL (batch API accepts a single file too)
+            create_resp = await client.post(
+                f"{self.api_base}/file-urls/batch",
+                headers=self._headers,
+                json={
+                    "files": [{"name": file_path.name, "data_id": file_path.stem}],
+                    "model_version": self.model_version,
+                    "enable_formula": self.formula_recognition,
+                    "enable_table": self.table_recognition,
+                    "language": self.language,
                 },
             )
+            create_data = self._unwrap(create_resp)
+            batch_id = create_data.get("batch_id")
+            file_urls = create_data.get("file_urls") or []
+            if not batch_id or not file_urls:
+                raise RuntimeError(f"MinerU batch create missing batch_id/file_urls: {create_data}")
 
-            logger.info(
-                "MinerU parsed {}: {} pages, {} formulas, {} tables",
-                pdf_path.name,
-                result.page_count,
-                result.formula_count,
-                result.table_count,
-            )
+            # 2. Upload the file bytes (PUT, no Content-Type per docs)
+            put_resp = await client.put(file_urls[0], content=file_path.read_bytes())
+            if put_resp.status_code not in (200, 201):
+                raise RuntimeError(f"MinerU file upload failed: HTTP {put_resp.status_code}")
 
-            return result
+            # 3. Poll for completion
+            deadline = time.monotonic() + self.poll_timeout
+            while True:
+                await asyncio.sleep(self.poll_interval)
+                poll_resp = await client.get(
+                    f"{self.api_base}/extract-results/batch/{batch_id}",
+                    headers=self._headers,
+                )
+                poll_data = self._unwrap(poll_resp)
+                results = poll_data.get("extract_result") or []
+                if not results:
+                    raise RuntimeError(f"MinerU batch results empty: {poll_data}")
+                entry = results[0]
+                state = entry.get("state", "")
+                if state == "done":
+                    zip_url = entry.get("full_zip_url")
+                    if not zip_url:
+                        raise RuntimeError(f"MinerU done but no full_zip_url: {entry}")
+                    break
+                if state == "failed":
+                    raise RuntimeError(f"MinerU parsing failed: {entry.get('err_msg', 'unknown')}")
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"MinerU parsing timed out after {self.poll_timeout}s (state={state})")
 
-        except Exception as e:
-            logger.error("MinerU parsing failed for {}: {}", pdf_path.name, e)
-            # Return error as parsed document
-            return ParsedDocument(
-                markdown_content=f"[MinerU parsing error: {e}]",
-                metadata={
-                    "source": str(pdf_path),
-                    "parser": "mineru",
-                    "error": str(e),
-                },
-            )
+            # 4. Download and extract the markdown from the result zip
+            zip_resp = await client.get(zip_url)
+            zip_resp.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+                md_candidates = [n for n in zf.namelist() if n.lower().endswith(".md")]
+                if not md_candidates:
+                    raise RuntimeError(f"No markdown file in MinerU result zip: {zf.namelist()}")
+                # Prefer full.md / *.md at zip root; fall back to the largest md
+                best = next(
+                    (n for n in md_candidates if Path(n).name == "full.md"),
+                    max(md_candidates, key=lambda n: zf.getinfo(n).file_size),
+                )
+                md_content = zf.read(best).decode("utf-8", errors="replace")
+
+        return ParsedDocument(
+            markdown_content=md_content,
+            page_count=_count_pages(md_content),
+            formula_count=md_content.count("$$") // 2,
+            table_count=md_content.count("|---"),
+            metadata={
+                "source": str(file_path),
+                "parser": "mineru-api",
+                "model_version": self.model_version,
+            },
+        )
 
     @staticmethod
-    def _count_pages(content: str) -> int:
-        """Count pages from markdown content."""
-        # MinerU typically marks pages with "--- Page N ---" or similar
-        import re
-        pages = re.findall(r"---\s*Page\s+(\d+)\s*---", content)
-        if pages:
-            return max(int(p) for p in pages)
-        # Fallback: estimate from content length
-        return max(1, len(content) // 3000)
+    def _unwrap(resp: httpx.Response) -> dict[str, Any]:
+        """Validate the MinerU response envelope and return ``data``.
+
+        Business endpoints return ``{"code": 0, "data": {...}, "msg": "ok"}``;
+        the auth/gateway layer returns ``{"success": false, "msgCode": ...}``
+        on failure — both shapes are handled here.
+        """
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("success") is False:
+            raise RuntimeError(
+                f"MinerU API auth error: {body.get('msgCode')} {body.get('msg')}"
+            )
+        if body.get("code") not in (0, None):
+            raise RuntimeError(f"MinerU API error {body.get('code')}: {body.get('msg')}")
+        return body.get("data") or {}

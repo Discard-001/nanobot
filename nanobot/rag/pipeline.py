@@ -21,14 +21,13 @@ Usage:
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
-from nanobot.rag.chunker import Chunk, TextChunker
+from nanobot.rag.chunker import TextChunker
 from nanobot.rag.embedding import EmbeddingService
 from nanobot.rag.reranker import RerankerService
 from nanobot.rag.vector_store import FAISSVectorStore
@@ -94,6 +93,8 @@ class RAGPipeline:
         reranker_service: RerankerService,
         vector_store: FAISSVectorStore,
         chunker: TextChunker | None = None,
+        chunk_size: int = 512,
+        chunk_overlap: int = 64,
         top_k: int = 10,
         similarity_threshold: float = 0.3,
         max_context_length: int = 4096,
@@ -105,7 +106,9 @@ class RAGPipeline:
             embedding_service: Embedding generation service.
             reranker_service: Reranking service.
             vector_store: Vector storage backend.
-            chunker: Text chunker (default: TextChunker with 512/64).
+            chunker: Text chunker (overrides chunk_size/chunk_overlap).
+            chunk_size: Target chunk size in characters (default chunker).
+            chunk_overlap: Overlap between consecutive chunks (default chunker).
             top_k: Number of results to retrieve.
             similarity_threshold: Minimum similarity score.
             max_context_length: Max characters in assembled context.
@@ -114,19 +117,30 @@ class RAGPipeline:
         self.embedding_service = embedding_service
         self.reranker_service = reranker_service
         self.vector_store = vector_store
-        self.chunker = chunker or TextChunker()
+        self.chunker = chunker or TextChunker(
+            chunk_size=chunk_size, chunk_overlap=chunk_overlap
+        )
         self.top_k = top_k
         self.similarity_threshold = similarity_threshold
         self.max_context_length = max_context_length
         self.mineru_parser = mineru_parser
+        self._initialized = False
 
     async def initialize(self):
         """Initialize the pipeline (load vector store)."""
+        if self._initialized:
+            return
         await self.vector_store.initialize()
+        self._initialized = True
         logger.info(
             "RAG pipeline initialized: {} vectors in store",
             self.vector_store.count,
         )
+
+    async def _ensure_initialized(self):
+        """Lazily initialize on first use (ingest/query)."""
+        if not self._initialized:
+            await self.initialize()
 
     async def ingest(
         self,
@@ -161,6 +175,8 @@ class RAGPipeline:
         meta["filename"] = file_path.name
 
         try:
+            await self._ensure_initialized()
+
             # Extract text based on file type
             text = await self._extract_text(file_path)
             if not text.strip():
@@ -171,8 +187,9 @@ class RAGPipeline:
                     error="No text content extracted",
                 )
 
-            # Chunk the text
-            chunks = self.chunker.chunk(text, meta)
+            # Chunk the text (header-aware: keeps section headers with their
+            # content and records the header in chunk metadata)
+            chunks = self.chunker.chunk_markdown(text, meta)
             if not chunks:
                 return IngestResult(
                     source=str(file_path),
@@ -226,6 +243,8 @@ class RAGPipeline:
             RAGResult with context and sources.
         """
         k = top_k or self.top_k
+
+        await self._ensure_initialized()
 
         # Generate query embedding
         query_vector = await self.embedding_service.embed_query(question)

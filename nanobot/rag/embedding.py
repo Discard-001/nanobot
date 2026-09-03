@@ -17,7 +17,6 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 
 import httpx
 from loguru import logger
@@ -37,19 +36,26 @@ class EmbeddingService:
         - Runs on CPU/GPU/MPS based on config
     """
 
+    _PROVIDER_BASE_URLS = {
+        "modelscope": "https://api-inference.modelscope.cn/v1",
+        "siliconflow": "https://api.siliconflow.cn/v1",
+    }
+
     def __init__(
         self,
         provider: str = "modelscope",
         model_name: str = "BAAI/bge-m3",
         api_key: str = "",
-        base_url: str = "https://api-inference.modelscope.cn/v1",
+        base_url: str = "",
         device: str = "cpu",
         dimensions: int = 1024,
     ):
         self.provider = provider
         self.model_name = model_name
         self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        self.base_url = (
+            base_url.rstrip("/") or self._PROVIDER_BASE_URLS.get(provider, "")
+        )
         self.device = device
         self.dimensions = dimensions
         self._local_model = None
@@ -66,7 +72,8 @@ class EmbeddingService:
         if not texts:
             return []
 
-        if self.provider == "modelscope":
+        if self.provider in ("modelscope", "siliconflow"):
+            # Both expose the same OpenAI-compatible /embeddings endpoint
             return await self._embed_via_modelscope(texts)
         elif self.provider == "local":
             return await self._embed_local(texts)

@@ -248,10 +248,10 @@ class HeartbeatConfig(Base):
 class EmbeddingConfig(Base):
     """Embedding model configuration."""
 
-    provider: str = "modelscope"  # modelscope | local
+    provider: str = "modelscope"  # modelscope | siliconflow | local
     model_name: str = "BAAI/bge-m3"
-    api_key: str = ""  # ModelScope API Key (optional for local mode)
-    base_url: str = "https://api-inference.modelscope.cn/v1"
+    api_key: str = ""  # API key (required for remote providers)
+    base_url: str = Field(default="", validation_alias=AliasChoices("baseUrl", "base_url"))
     device: str = "cpu"  # cpu | cuda | mps
     dimensions: int = 1024  # bge-m3 output dimensions
 
@@ -260,9 +260,10 @@ class RerankerConfig(Base):
     """Reranker model configuration."""
 
     enabled: bool = True
-    provider: str = "modelscope"  # modelscope | local
+    provider: str = "modelscope"  # modelscope | siliconflow | local
     model_name: str = "BAAI/bge-reranker-v2-m3"
-    api_key: str = ""  # ModelScope API Key (optional for local mode)
+    api_key: str = ""  # API key (required for remote providers)
+    base_url: str = Field(default="", validation_alias=AliasChoices("baseUrl", "base_url"))
     top_k: int = 5  # Results to keep after reranking
 
 
@@ -281,12 +282,27 @@ class RAGConfig(Base):
 
 
 class MinerUConfig(Base):
-    """MinerU PDF parsing configuration."""
+    """MinerU PDF parsing configuration (mineru.net cloud API)."""
 
     enable: bool = False
-    device: str = "cpu"  # cpu | cuda
+    api_token: str = Field(default="", validation_alias=AliasChoices("apiToken", "api_token"))
+    api_base: str = Field(default="", validation_alias=AliasChoices("apiBase", "api_base"))
+    model_version: str = Field(
+        default="vlm",
+        validation_alias=AliasChoices("modelVersion", "model_version"),
+    )
+    language: str = "ch"  # Document language hint
     formula_recognition: bool = True  # Formula recognition
     table_recognition: bool = True  # Table recognition
+
+    @model_validator(mode="after")
+    def _validate_api_token(self) -> "MinerUConfig":
+        if self.enable and not self.api_token:
+            raise ValueError(
+                "tools.mineru.apiToken is required when tools.mineru.enable is true "
+                "(get one at https://mineru.net/apiManage/token)"
+            )
+        return self
 
 
 class ApiConfig(Base):

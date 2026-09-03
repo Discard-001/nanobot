@@ -36,11 +36,13 @@ async def test_state_restore_extracts_documents_by_default(
     doc_path.write_text("Quarterly revenue is $5M", encoding="utf-8")
     calls: list[tuple[str, list[str]]] = []
 
-    def fake_extract_documents(content: str, media: list[str]) -> tuple[str, list[str]]:
+    async def fake_extract_documents(
+        content: str, media: list[str], *, pdf_parser=None
+    ) -> tuple[str, list[str]]:
         calls.append((content, media))
         return f"{content}\n\n[File: report.txt]\nQuarterly revenue is $5M", []
 
-    monkeypatch.setattr("nanobot.agent.loop.extract_documents", fake_extract_documents)
+    monkeypatch.setattr("nanobot.agent.loop.extract_documents_async", fake_extract_documents)
 
     ctx = TurnContext(
         msg=InboundMessage(
@@ -71,10 +73,12 @@ async def test_state_restore_references_documents_when_extraction_disabled(
     doc_path = tmp_path / "report.txt"
     doc_path.write_text("Quarterly revenue is $5M", encoding="utf-8")
 
-    def fail_extract_documents(content: str, media: list[str]) -> tuple[str, list[str]]:
+    async def fail_extract_documents(
+        content: str, media: list[str], *, pdf_parser=None
+    ) -> tuple[str, list[str]]:
         raise AssertionError("document extraction should be disabled")
 
-    monkeypatch.setattr("nanobot.agent.loop.extract_documents", fail_extract_documents)
+    monkeypatch.setattr("nanobot.agent.loop.extract_documents_async", fail_extract_documents)
 
     ctx = TurnContext(
         msg=InboundMessage(
@@ -115,10 +119,12 @@ async def test_pending_followup_references_documents_when_extraction_disabled(
     loop.provider.chat_with_retry = chat_with_retry
     loop.tools.get_definitions = MagicMock(return_value=[])
 
-    def fail_extract_documents(content: str, media: list[str]) -> tuple[str, list[str]]:
+    async def fail_extract_documents(
+        content: str, media: list[str], *, pdf_parser=None
+    ) -> tuple[str, list[str]]:
         raise AssertionError("document extraction should be disabled")
 
-    monkeypatch.setattr("nanobot.agent.loop.extract_documents", fail_extract_documents)
+    monkeypatch.setattr("nanobot.agent.loop.extract_documents_async", fail_extract_documents)
 
     pending_queue: asyncio.Queue[InboundMessage] = asyncio.Queue()
     await pending_queue.put(

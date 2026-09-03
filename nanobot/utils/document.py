@@ -2,6 +2,7 @@
 
 import mimetypes
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
@@ -312,6 +313,64 @@ def extract_documents(
             extracted = extract_text(p)
             if extracted and not extracted.startswith("[error:"):
                 doc_texts.append(f"[File: {p.name}]\n{extracted}")
+
+    if doc_texts:
+        text = text + "\n\n" + "\n\n".join(doc_texts)
+
+    return text, image_paths
+
+
+async def extract_documents_async(
+    text: str,
+    media_paths: list[str],
+    *,
+    pdf_parser: Any | None = None,
+    max_file_size: int = _MAX_EXTRACT_FILE_SIZE,
+) -> tuple[str, list[str]]:
+    """Async variant of :func:`extract_documents`.
+
+    When *pdf_parser* is provided (any object with an async
+    ``parse(path) -> ParsedDocument`` interface, e.g. MinerUApiParser),
+    PDFs are routed through it for structured parsing (formulas as LaTeX,
+    tables as Markdown). Failures fall back to the plain pypdf path.
+    """
+    image_paths: list[str] = []
+    doc_texts: list[str] = []
+
+    for path_str in media_paths:
+        p = Path(path_str)
+        if not p.is_file():
+            continue
+
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        if size > max_file_size:
+            logger.warning(
+                "Skipping oversized file for extraction: {} ({:.1f} MB > {} MB limit)",
+                p.name, size / (1024 * 1024), max_file_size // (1024 * 1024),
+            )
+            continue
+
+        if is_image_file(path_str):
+            image_paths.append(path_str)
+            continue
+
+        extracted = None
+        if pdf_parser is not None and p.suffix.lower() == ".pdf":
+            try:
+                result = await pdf_parser.parse(p)
+                extracted = result.markdown_content
+            except Exception as e:
+                logger.warning(
+                    "Structured PDF parsing failed for {}, falling back to plain extraction: {}",
+                    p.name, e,
+                )
+        if extracted is None:
+            extracted = extract_text(p)
+        if extracted and not extracted.startswith("[error:"):
+            doc_texts.append(f"[File: {p.name}]\n{extracted}")
 
     if doc_texts:
         text = text + "\n\n" + "\n\n".join(doc_texts)

@@ -39,19 +39,22 @@ from nanobot.security.workspace_access import (
     bind_workspace_scope,
     reset_workspace_scope,
 )
+from nanobot.session import turn_continuation
 from nanobot.session.goal_state import (
     goal_state_runtime_lines,
     runner_wall_llm_timeout_s,
     sustained_goal_active,
 )
 from nanobot.session.manager import Session, SessionManager
-from nanobot.session import turn_continuation
 from nanobot.session.webui_turns import (
     WebuiTurnCoordinator,
     build_bus_progress_callback,
     mark_webui_session,
 )
-from nanobot.utils.document import extract_documents, reference_non_image_attachments
+from nanobot.utils.document import (
+    extract_documents_async,
+    reference_non_image_attachments,
+)
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
@@ -239,6 +242,8 @@ class AgentLoop:
             else defaults.tool_hint_max_length
         )
         self.tools_config = _tc
+        self._mineru_parser: Any | None = None  # set during setup (_create_mineru_parser)
+        self._rag_pipeline: Any | None = None  # set during setup (_register_default_tools)
         self.web_config = _tc.web
         self.exec_config = _tc.exec
         self._image_generation_provider_configs = dict(image_generation_provider_configs or {})
@@ -472,6 +477,10 @@ class AgentLoop:
         from nanobot.agent.tools.context import ToolContext
         from nanobot.agent.tools.loader import ToolLoader
 
+        # Structured PDF parser (MinerU) — created regardless of RAG so chat
+        # attachments can use it too (see _prepare_message_media).
+        self._mineru_parser = self._create_mineru_parser()
+
         # Initialize RAG pipeline if enabled
         rag_pipeline = None
         if self.tools_config.rag.enable:
@@ -505,6 +514,26 @@ class AgentLoop:
 
         logger.info("Registered {} tools: {}", len(registered), registered)
 
+    def _create_mineru_parser(self):
+        """Create the structured PDF parser (MinerU cloud API).
+        Returns None when disabled or unavailable."""
+        mineru_cfg = self.tools_config.mineru
+        if not mineru_cfg.enable:
+            return None
+        try:
+            from nanobot.utils.mineru_parser import MinerUApiParser
+            return MinerUApiParser(
+                api_token=mineru_cfg.api_token,
+                model_version=mineru_cfg.model_version,
+                language=mineru_cfg.language,
+                formula_recognition=mineru_cfg.formula_recognition,
+                table_recognition=mineru_cfg.table_recognition,
+                **({"api_base": mineru_cfg.api_base} if mineru_cfg.api_base else {}),
+            )
+        except (ImportError, ValueError) as e:
+            logger.warning("MinerU not available: {}", e)
+            return None
+
     def _create_rag_pipeline(self):
         """Create and initialize RAG pipeline from config.
 
@@ -537,6 +566,7 @@ class AgentLoop:
             provider=rag_config.reranker.provider,
             model_name=rag_config.reranker.model_name,
             api_key=rag_config.reranker.api_key,
+            base_url=rag_config.reranker.base_url,
             top_k=rag_config.reranker.top_k,
         )
 
@@ -547,18 +577,8 @@ class AgentLoop:
             dimensions=rag_config.embedding.dimensions,
         )
 
-        # Create MinerU parser if enabled
-        mineru_parser = None
-        if self.tools_config.mineru.enable:
-            try:
-                from nanobot.utils.mineru_parser import MinerUParser
-                mineru_parser = MinerUParser(
-                    device=self.tools_config.mineru.device,
-                    formula_recognition=self.tools_config.mineru.formula_recognition,
-                    table_recognition=self.tools_config.mineru.table_recognition,
-                )
-            except ImportError as e:
-                logger.warning("MinerU not available: {}", e)
+        # Structured PDF parser shared with chat-attachment extraction
+        mineru_parser = self._mineru_parser
 
         # Create pipeline
         pipeline = RAGPipeline(
@@ -798,11 +818,11 @@ class AgentLoop:
             if pending_queue is None:
                 return []
 
-            def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
+            async def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
                 content = pending_msg.content
                 media = pending_msg.media if pending_msg.media else None
                 if media:
-                    content, media = self._prepare_message_media(content, media)
+                    content, media = await self._prepare_message_media(content, media)
                     media = media or None
                 user_content = self.context._build_user_content(content, media)
                 return {"role": "user", "content": user_content}
@@ -810,7 +830,7 @@ class AgentLoop:
             items: list[dict[str, Any]] = []
             while len(items) < limit:
                 try:
-                    items.append(_to_user_message(pending_queue.get_nowait()))
+                    items.append(await _to_user_message(pending_queue.get_nowait()))
                 except asyncio.QueueEmpty:
                     break
 
@@ -828,10 +848,10 @@ class AgentLoop:
                         session.key,
                     )
                     return items
-                items.append(_to_user_message(msg))
+                items.append(await _to_user_message(msg))
                 while len(items) < limit:
                     try:
-                        items.append(_to_user_message(pending_queue.get_nowait()))
+                        items.append(await _to_user_message(pending_queue.get_nowait()))
                     except asyncio.QueueEmpty:
                         break
 
@@ -1377,7 +1397,7 @@ class AgentLoop:
         msg = ctx.msg
 
         if msg.media:
-            new_content, image_only = self._prepare_message_media(msg.content, msg.media)
+            new_content, image_only = await self._prepare_message_media(msg.content, msg.media)
             ctx.msg = dataclasses.replace(msg, content=new_content, media=image_only)
             msg = ctx.msg
 
@@ -1398,10 +1418,87 @@ class AgentLoop:
 
         return "ok"
 
-    def _prepare_message_media(self, content: str, media: list[str]) -> tuple[str, list[str]]:
-        if self._should_extract_document_text():
-            return extract_documents(content, media)
-        return reference_non_image_attachments(content, media)
+    async def _prepare_message_media(self, content: str, media: list[str]) -> tuple[str, list[str]]:
+        if not self._should_extract_document_text():
+            return reference_non_image_attachments(content, media)
+        # Bare document (no message text) + structured parser + knowledge base
+        # available: parse, archive, ingest, and ask the model to summarize.
+        if (
+            not content.strip()
+            and self._mineru_parser is not None
+            and self._rag_pipeline is not None
+            and any(p.lower().endswith(".pdf") for p in media)
+        ):
+            return await self._ingest_bare_documents(content, media)
+        return await extract_documents_async(
+            content, media, pdf_parser=self._mineru_parser
+        )
+
+    async def _ingest_bare_documents(
+        self, content: str, media: list[str]
+    ) -> tuple[str, list[str]]:
+        """Bare-PDF flow: MinerU parse → archive markdown → ingest into the
+        RAG knowledge base (header-aware chunks) → build a summarization
+        prompt so the user gets a useful reply without typing anything."""
+        pdfs = [p for p in media if p.lower().endswith(".pdf")]
+        others = [p for p in media if not p.lower().endswith(".pdf")]
+
+        new_content, image_only = await extract_documents_async(
+            content, others, pdf_parser=self._mineru_parser
+        )
+
+        doc_parts: list[str] = []
+        for pdf_path in pdfs:
+            p = Path(pdf_path)
+            if not p.is_file():
+                continue
+            try:
+                doc = await self._mineru_parser.parse(p)
+            except Exception as e:
+                logger.warning(
+                    "Structured parsing failed for {}: {}", p.name, e
+                )
+                # Degrade to plain extraction so the turn still works
+                plain, _ = await extract_documents_async("", [pdf_path])
+                if plain.strip():
+                    doc_parts.append(plain.strip())
+                continue
+
+            status = "已解析"
+            archive = self._archive_parsed_markdown(p, doc.markdown_content)
+            if archive is None:
+                status = "已解析（存档失败，未入库）"
+            else:
+                result = await self._rag_pipeline.ingest(archive)
+                if result.success:
+                    status = f"已解析并存入知识库（{result.chunk_count} 个分块）"
+                else:
+                    status = f"已解析（入库失败：{result.error}）"
+            doc_parts.append(f"[File: {p.name}]（{status}）\n{doc.markdown_content}")
+
+        if doc_parts:
+            instruction = (
+                "用户发送了文档但未附带任何指令。请根据以下文档内容给出结构化总结："
+                "主题与背景、核心方法/论点、关键结果或结论、（如有）可关注的细节。"
+                "并在结尾用一句话说明该文档已存入知识库，之后可以直接就内容提问。"
+                "文档内容如下："
+            )
+            prefix = new_content.strip() + "\n\n" if new_content.strip() else ""
+            new_content = prefix + instruction + "\n\n" + "\n\n".join(doc_parts)
+
+        return new_content, image_only
+
+    def _archive_parsed_markdown(self, source: Path, markdown: str) -> Path | None:
+        """Save parsed markdown into the workspace knowledge folder."""
+        try:
+            archive_dir = self.workspace / "knowledge"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            archive = archive_dir / f"{source.stem}.md"
+            archive.write_text(markdown, encoding="utf-8")
+            return archive
+        except OSError as e:
+            logger.warning("Failed to archive parsed markdown for {}: {}", source.name, e)
+            return None
 
     def _should_extract_document_text(self) -> bool:
         if self.channels_config is None:

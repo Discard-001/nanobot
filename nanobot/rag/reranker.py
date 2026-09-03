@@ -43,13 +43,18 @@ class RerankerService:
         provider: str = "modelscope",
         model_name: str = "BAAI/bge-reranker-v2-m3",
         api_key: str = "",
-        base_url: str = "https://api-inference.modelscope.cn/v1",
+        base_url: str = "",
         top_k: int = 5,
     ):
         self.provider = provider
         self.model_name = model_name
         self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        # Per-provider default when base_url is not configured explicitly
+        provider_defaults = {
+            "modelscope": "https://api-inference.modelscope.cn/v1",
+            "siliconflow": "https://api.siliconflow.cn/v1",
+        }
+        self.base_url = base_url.rstrip("/") or provider_defaults.get(provider, "")
         self.top_k = top_k
         self._local_model = None
 
@@ -78,7 +83,8 @@ class RerankerService:
 
         k = top_k or self.top_k
 
-        if self.provider == "modelscope":
+        if self.provider in ("modelscope", "siliconflow"):
+            # Both expose the same OpenAI-compatible /rerank endpoint
             results = await self._rerank_via_modelscope(query, documents)
         elif self.provider == "local":
             results = await self._rerank_local(query, documents)
