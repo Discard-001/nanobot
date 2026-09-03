@@ -7,7 +7,13 @@ import pytest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.feishu import FeishuChannel, FeishuConfig, _FeishuStreamBuf
+from nanobot.channels.feishu import (
+    FeishuChannel,
+    FeishuConfig,
+    _FeishuStreamBuf,
+    _format_reasoning_markdown,
+    _process_summary_header,
+)
 
 
 def _make_channel(streaming: bool = True, reply_to_message: bool = False) -> FeishuChannel:
@@ -578,3 +584,358 @@ class TestSendMessageReturnsId:
         ch._client.im.v1.message.create.return_value = resp
         result = ch._send_message_sync("chat_id", "oc_chat1", "text", '{"text":"hi"}')
         assert result is None
+
+
+class TestFormatReasoningMarkdown:
+    def test_open_header_with_quote(self):
+        out = _format_reasoning_markdown("step 1\nstep 2", finished=False)
+        assert out.startswith("> 💭 **深度思考中…**")
+        assert "> step 1" in out
+        assert "> step 2" in out
+
+    def test_finished_header(self):
+        out = _format_reasoning_markdown("thinking...", finished=True)
+        assert out.startswith("> 💭 **已深度思考**")
+        assert "> thinking..." in out
+
+    def test_empty_text_header_only(self):
+        assert _format_reasoning_markdown("", finished=False) == "> 💭 **深度思考中…**"
+
+    def test_long_text_truncated_to_tail(self):
+        text = "x" * 5000
+        out = _format_reasoning_markdown(text, finished=False)
+        assert len(out) < 2000  # tail-limited, not the full 5000 chars
+
+
+class TestReasoningStreaming:
+    @pytest.mark.asyncio
+    async def test_first_reasoning_delta_creates_card_with_reasoning_element(self):
+        ch = _make_channel()
+        ch.config.show_process_panel = False  # legacy layout: bare reasoning element
+        ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_r1")
+        ch._client.im.v1.message.create.return_value = _mock_send_response()
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_reasoning_delta("oc_chat1", "Analyzing the request")
+
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.card_id == "card_r1"
+        assert buf.has_reasoning_element is True
+        assert buf.reasoning_open is True
+        # Card creation payload must contain the reasoning element above content
+        create_payload = ch._client.cardkit.v1.card.create.call_args[0][0]
+        import json as _json
+        card_data = _json.loads(create_payload.request_body.data)
+        element_ids = [el["element_id"] for el in card_data["body"]["elements"]]
+        assert element_ids == ["reasoning_md", "streaming_md"]
+        # First update targets the reasoning element
+        update_req = ch._client.cardkit.v1.card_element.content.call_args[0][0]
+        assert update_req.element_id == "reasoning_md"
+        assert "Analyzing the request" in update_req.request_body.content
+
+    @pytest.mark.asyncio
+    async def test_reasoning_end_freezes_with_done_header(self):
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            reasoning="Because of X", card_id="card_1", sequence=2,
+            reasoning_open=True, has_reasoning_element=True,
+        )
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_reasoning_end("oc_chat1")
+
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.reasoning_open is False
+        assert buf.sequence == 3
+        update_req = ch._client.cardkit.v1.card_element.content.call_args[0][0]
+        assert update_req.element_id == "reasoning_md"
+        assert "已深度思考" in update_req.request_body.content
+        assert "Because of X" in update_req.request_body.content
+
+    @pytest.mark.asyncio
+    async def test_reasoning_then_content_shares_card(self):
+        """Content deltas reuse the card created by reasoning and target the content element."""
+        ch = _make_channel()
+        ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_r1")
+        ch._client.im.v1.message.create.return_value = _mock_send_response()
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_reasoning_delta("oc_chat1", "thinking")
+        await ch.send_reasoning_end("oc_chat1")
+        await ch.send_delta("oc_chat1", "Final answer")
+
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.text == "Final answer"
+        # Only one card was created for the whole turn
+        assert ch._client.cardkit.v1.card.create.call_count == 1
+        last_req = ch._client.cardkit.v1.card_element.content.call_args[0][0]
+        assert last_req.element_id == "streaming_md"
+        assert last_req.request_body.content == "Final answer"
+
+    @pytest.mark.asyncio
+    async def test_content_first_card_degrades_reasoning_inline(self):
+        """Reasoning after a content-only card folds into the content element as a quote."""
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="Partial answer", card_id="card_1", sequence=2, last_edit=0.0,
+        )
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_reasoning_delta("oc_chat1", "round two thoughts")
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.reasoning == ""
+        assert "💭 **深度思考中…**" in buf.text
+        assert "> round two thoughts" in buf.text
+        update_req = ch._client.cardkit.v1.card_element.content.call_args[0][0]
+        assert update_req.element_id == "streaming_md"
+
+        await ch.send_reasoning_end("oc_chat1")
+        assert "💭 **已深度思考**" in buf.text
+        assert "💭 **深度思考中…**" not in buf.text
+
+    @pytest.mark.asyncio
+    async def test_stream_end_reasoning_only_closes_streaming_mode(self):
+        """Reasoning with no answer text still exits streaming mode cleanly."""
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="", reasoning="only thoughts", card_id="card_1", sequence=2,
+            reasoning_open=True, has_reasoning_element=True,
+        )
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+        ch._client.cardkit.v1.card.settings.return_value = _mock_content_response()
+
+        await ch.send_delta("oc_chat1", "", metadata={"_stream_end": True})
+
+        assert "oc_chat1" not in ch._stream_bufs
+        # Freeze reasoning (seq 3) then close streaming mode (seq 4)
+        settings_req = ch._client.cardkit.v1.card.settings.call_args[0][0]
+        assert settings_req.body.sequence == 4
+        update_req = ch._client.cardkit.v1.card_element.content.call_args[0][0]
+        assert update_req.element_id == "reasoning_md"
+        assert "已深度思考" in update_req.request_body.content
+
+    @pytest.mark.asyncio
+    async def test_throttled_reasoning_updates(self):
+        """Second reasoning chunk within the interval does not trigger an API call."""
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            reasoning="first", card_id="card_1", sequence=1,
+            reasoning_open=True, has_reasoning_element=True,
+            last_reasoning_edit=time.monotonic(),
+        )
+
+        await ch.send_reasoning_delta("oc_chat1", " second")
+
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.reasoning == "first second"
+        assert buf.sequence == 1
+        ch._client.cardkit.v1.card_element.content.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reasoning_delta_disabled_when_streaming_off(self):
+        ch = _make_channel(streaming=False)
+        await ch.send_reasoning_delta("oc_chat1", "thinking")
+        assert "oc_chat1" not in ch._stream_bufs
+        ch._client.cardkit.v1.card.create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reasoning_end_without_buf_is_noop(self):
+        ch = _make_channel()
+        await ch.send_reasoning_end("oc_chat1")
+        ch._client.cardkit.v1.card_element.content.assert_not_called()
+
+
+class TestProcessPanel:
+    """Collapsible panel unifying multi-round reasoning + tool calls on one card."""
+
+    @pytest.mark.asyncio
+    async def test_reasoning_creates_card_with_collapsible_panel(self):
+        ch = _make_channel()  # show_process_panel defaults to True
+        ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_p1")
+        ch._client.im.v1.message.create.return_value = _mock_send_response()
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_reasoning_delta("oc_chat1", "step one")
+
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.card_id == "card_p1"
+        assert buf.has_tool_element is True
+        assert buf.reasoning_rounds == 1
+        create_payload = ch._client.cardkit.v1.card.create.call_args[0][0]
+        import json as _json
+        card_data = _json.loads(create_payload.request_body.data)
+        elements = card_data["body"]["elements"]
+        assert [el["element_id"] for el in elements] == ["process_panel", "streaming_md"]
+        panel = elements[0]
+        assert panel["tag"] == "collapsible_panel"
+        assert panel["expanded"] is True
+        child_ids = [el["element_id"] for el in panel["elements"]]
+        assert child_ids == ["reasoning_md", "tool_md"]
+        # Panel mode streams the raw trace (no quote header)
+        update_req = ch._client.cardkit.v1.card_element.content.call_args[0][0]
+        assert update_req.element_id == "reasoning_md"
+        assert update_req.request_body.content == "step one"
+
+    @pytest.mark.asyncio
+    async def test_tool_hint_routed_to_panel_tool_element(self):
+        ch = _make_channel()
+        ch._stream_bufs["om_in_1"] = _FeishuStreamBuf(
+            card_id="card_1", sequence=2, has_reasoning_element=True,
+            has_tool_element=True,
+        )
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        msg = OutboundMessage(
+            channel="feishu", chat_id="oc_chat1",
+            content="web_search(query='test')",
+            metadata={"_tool_hint": True, "message_id": "om_in_1"},
+        )
+        await ch.send(msg)
+
+        buf = ch._stream_bufs["om_in_1"]
+        assert buf.tool_count == 1
+        assert "web_search" in buf.tool_log
+        assert buf.text == ""  # answer text stays clean
+        update_req = ch._client.cardkit.v1.card_element.content.call_args[0][0]
+        assert update_req.element_id == "tool_md"
+        assert "web_search" in update_req.request_body.content
+
+    @pytest.mark.asyncio
+    async def test_tool_hint_creates_panel_card_when_no_card_yet(self):
+        ch = _make_channel()
+        ch._stream_bufs["om_in_1"] = _FeishuStreamBuf()
+        ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_p2")
+        ch._client.im.v1.message.create.return_value = _mock_send_response()
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        msg = OutboundMessage(
+            channel="feishu", chat_id="oc_chat1",
+            content="read_file(path='a.py')",
+            metadata={"_tool_hint": True, "message_id": "om_in_1"},
+        )
+        await ch.send(msg)
+
+        buf = ch._stream_bufs["om_in_1"]
+        assert buf.card_id == "card_p2"
+        assert buf.has_tool_element is True
+        assert buf.tool_count == 1
+        ch._client.cardkit.v1.card.create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_tool_hint_legacy_mode_inlines_into_text(self):
+        ch = _make_channel()
+        ch.config.show_process_panel = False
+        ch._stream_bufs["om_in_1"] = _FeishuStreamBuf(
+            text="partial", card_id="card_1", sequence=1, last_edit=0.0,
+        )
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        msg = OutboundMessage(
+            channel="feishu", chat_id="oc_chat1",
+            content="shell(cmd='ls')",
+            metadata={"_tool_hint": True, "message_id": "om_in_1"},
+        )
+        await ch.send(msg)
+
+        buf = ch._stream_bufs["om_in_1"]
+        assert buf.tool_log == ""  # legacy mode does not use the tool element
+        assert "shell" in buf.text
+
+    @pytest.mark.asyncio
+    async def test_multi_round_reasoning_appends_separator(self):
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            reasoning="round one", card_id="card_1", sequence=2,
+            reasoning_open=False, has_reasoning_element=True,
+            has_tool_element=True, reasoning_rounds=1, last_reasoning_edit=0.0,
+        )
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_reasoning_delta("oc_chat1", "round two")
+
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.reasoning_rounds == 2
+        assert "round one" in buf.reasoning
+        assert "round two" in buf.reasoning
+        assert "···" in buf.reasoning  # round separator present
+
+    @pytest.mark.asyncio
+    async def test_stream_end_collapses_panel_with_summary_header(self):
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="final answer", reasoning="thoughts", card_id="card_1", sequence=3,
+            has_reasoning_element=True, has_tool_element=True,
+            reasoning_rounds=2, tool_count=3,
+        )
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+        ch._client.cardkit.v1.card.settings.return_value = _mock_content_response()
+        ch._client.cardkit.v1.card_element.patch.return_value = _mock_content_response()
+
+        await ch.send_delta("oc_chat1", "", metadata={"_stream_end": True})
+
+        assert "oc_chat1" not in ch._stream_bufs
+        patch_req = ch._client.cardkit.v1.card_element.patch.call_args[0][0]
+        assert patch_req.element_id == "process_panel"
+        import json as _json
+        partial = _json.loads(patch_req.request_body.partial_element)
+        assert partial["expanded"] is False
+        assert "思考 2 轮" in partial["header"]["title"]["content"]
+        assert "工具 3 次" in partial["header"]["title"]["content"]
+        # Panel children are re-sent with final content
+        child_map = {el["element_id"]: el["content"] for el in partial["elements"]}
+        assert child_map["reasoning_md"] == "thoughts"
+        # Streaming mode closed after collapse (text update seq 4, patch seq 5, close seq 6)
+        settings_req = ch._client.cardkit.v1.card.settings.call_args[0][0]
+        assert settings_req.body.sequence == 6
+
+    @pytest.mark.asyncio
+    async def test_resuming_stream_end_keeps_card_open(self):
+        """Tool-round boundary: card stays open for the next round on the same card."""
+        ch = _make_channel()
+        # Stream buffers are keyed by the inbound message_id when present
+        ch._stream_bufs["om_1"] = _FeishuStreamBuf(
+            text="partial", card_id="card_1", sequence=2,
+            has_tool_element=True,
+        )
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_delta(
+            "oc_chat1", "", metadata={"_stream_end": True, "_resuming": True, "message_id": "om_1"}
+        )
+
+        buf = ch._stream_bufs["om_1"]
+        assert buf is not None and buf.new_round is True
+        assert buf.card_id == "card_1"
+        ch._client.cardkit.v1.card.settings.assert_not_called()  # never closed
+
+    @pytest.mark.asyncio
+    async def test_new_round_content_adds_separator(self):
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="round one text", card_id="card_1", sequence=2,
+            new_round=True, last_edit=0.0,
+        )
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_delta("oc_chat1", "round two text")
+
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.new_round is False
+        assert "round one text" in buf.text
+        assert "round two text" in buf.text
+        assert "···" in buf.text
+
+
+class TestProcessSummaryHeader:
+    def test_rounds_and_tools(self):
+        header = _process_summary_header(2, 3)
+        assert "思考 2 轮" in header
+        assert "工具 3 次" in header
+
+    def test_single_round_no_round_label(self):
+        header = _process_summary_header(1, 0)
+        assert "1 轮" not in header
+        assert "工具" not in header
+
+    def test_empty(self):
+        assert _process_summary_header(0, 0) == "⚙️ **执行过程**"

@@ -258,11 +258,83 @@ class FeishuConfig(Base):
     group_policy: Literal["open", "mention"] = "mention"
     reply_to_message: bool = False  # If True, bot replies quote the user's original message
     streaming: bool = True
+    show_process_panel: bool = True  # Collapsible panel for reasoning + tool calls
     domain: Literal["feishu", "lark"] = "feishu"  # Set to "lark" for international Lark
     topic_isolation: bool = True  # If True, each topic in group chat gets its own session (isolation)
 
 
 _STREAM_ELEMENT_ID = "streaming_md"
+_REASONING_ELEMENT_ID = "reasoning_md"
+_TOOL_ELEMENT_ID = "tool_md"
+_PROCESS_PANEL_ID = "process_panel"
+
+# Render only the tail of long reasoning traces so card element content stays
+# within CardKit size limits while still feeling "live".
+_REASONING_TAIL_CHARS = 1200
+_TOOL_LOG_TAIL_CHARS = 4000
+_REASONING_OPEN_HEADER = "💭 **深度思考中…**"
+_REASONING_DONE_HEADER = "💭 **已深度思考**"
+_PROCESS_PANEL_HEADER = "⚙️ **执行过程**"
+_ROUND_SEPARATOR = "\n\n**···**\n\n"
+
+
+def _process_summary_header(reasoning_rounds: int, tool_count: int) -> str:
+    """Header shown on the collapsed process panel once the turn finishes."""
+    parts: list[str] = []
+    if reasoning_rounds > 1:
+        parts.append(f"💭 思考 {reasoning_rounds} 轮")
+    elif reasoning_rounds == 1:
+        parts.append("💭 已思考")
+    if tool_count > 0:
+        parts.append(f"🔧 工具 {tool_count} 次")
+    suffix = f"（{' · '.join(parts)}）" if parts else ""
+    return f"{_PROCESS_PANEL_HEADER}{suffix}"
+
+
+def _process_panel_element(
+    *, expanded: bool = True, header: str = _PROCESS_PANEL_HEADER,
+    reasoning: str = "", tool_log: str = "",
+) -> dict[str, Any]:
+    """Build the collapsible process panel element (reasoning + tool log)."""
+    return {
+        "tag": "collapsible_panel",
+        "element_id": _PROCESS_PANEL_ID,
+        "expanded": expanded,
+        "background_color": "grey",
+        "header": {"title": {"tag": "markdown", "content": header}, "vertical_align": "center"},
+        "elements": [
+            {"tag": "markdown", "element_id": _REASONING_ELEMENT_ID,
+             "content": _tail_text(reasoning, _REASONING_TAIL_CHARS)},
+            {"tag": "markdown", "element_id": _TOOL_ELEMENT_ID,
+             "content": _tail_text(tool_log, _TOOL_LOG_TAIL_CHARS)},
+        ],
+    }
+
+
+def _tail_text(text: str, tail_chars: int) -> str:
+    """Keep only the tail of long live-updated text to respect card size limits."""
+    return text[-tail_chars:].strip() if text else ""
+
+
+def _quote_reasoning_lines(text: str, tail_chars: int = _REASONING_TAIL_CHARS) -> str:
+    """Quote each line of a reasoning trace (markdown block quote)."""
+    tail = text[-tail_chars:].strip() if text else ""
+    if not tail:
+        return ""
+    return "\n".join(f"> {line}".rstrip() for line in tail.splitlines())
+
+
+def _format_reasoning_markdown(text: str, *, finished: bool) -> str:
+    """Format reasoning text as a quote block for the streaming card.
+
+    ``finished`` switches the header from "thinking…" to "thought" so users
+    can see the model finished its reasoning pass.
+    """
+    header = _REASONING_DONE_HEADER if finished else _REASONING_OPEN_HEADER
+    quoted = _quote_reasoning_lines(text)
+    if not quoted:
+        return f"> {header}"
+    return f"> {header}\n{quoted}"
 
 
 @dataclass
@@ -273,6 +345,18 @@ class _FeishuStreamBuf:
     card_id: str | None = None
     sequence: int = 0
     last_edit: float = 0.0
+    # Reasoning trace state (element above the content element on the card).
+    reasoning: str = ""
+    reasoning_open: bool = False
+    last_reasoning_edit: float = 0.0
+    has_reasoning_element: bool = False  # card was created with a reasoning element
+    reasoning_inlined: bool = False  # degraded mode: header already in content text
+    # Process panel state (collapsible panel with reasoning + tool log).
+    reasoning_rounds: int = 0  # number of reasoning passes in this turn
+    tool_log: str = ""  # accumulated tool hints (panel mode)
+    tool_count: int = 0
+    has_tool_element: bool = False  # card was created with the process panel
+    new_round: bool = False  # set on _resuming stream end; next delta adds a separator
 
 
 class FeishuChannel(BaseChannel):
@@ -1262,22 +1346,33 @@ class FeishuChannel(BaseChannel):
         reply_message_id: str | None = None,
         *,
         reply_in_thread: bool = False,
+        with_reasoning: bool = False,
+        with_process: bool = False,
     ) -> str | None:
         """Create a CardKit streaming card, send it to chat, return card_id.
 
         When *reply_message_id* is provided the card is delivered via the
         reply API. *reply_in_thread* controls whether Feishu creates a
         thread/topic for that reply. Otherwise the plain create-message API is
-        used.
+        used. *with_process* prepends a collapsible panel (reasoning + tool
+        log children) above the content element; *with_reasoning* prepends a
+        bare reasoning trace element (legacy layout).
         """
         from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
 
+        elements: list[dict[str, Any]] = []
+        if with_process:
+            elements.append(_process_panel_element(expanded=True))
+        elif with_reasoning:
+            elements.append(
+                {"tag": "markdown", "content": _format_reasoning_markdown("", finished=False),
+                 "element_id": _REASONING_ELEMENT_ID}
+            )
+        elements.append({"tag": "markdown", "content": "", "element_id": _STREAM_ELEMENT_ID})
         card_json = {
             "schema": "2.0",
             "config": {"wide_screen_mode": True, "update_multi": True, "streaming_mode": True},
-            "body": {
-                "elements": [{"tag": "markdown", "content": "", "element_id": _STREAM_ELEMENT_ID}]
-            },
+            "body": {"elements": elements},
         }
         try:
             request = (
@@ -1320,8 +1415,11 @@ class FeishuChannel(BaseChannel):
             self.logger.warning("Error creating streaming card: {}", e)
             return None
 
-    def _stream_update_text_sync(self, card_id: str, content: str, sequence: int) -> bool:
-        """Stream-update the markdown element on a CardKit card (typewriter effect)."""
+    def _stream_update_text_sync(
+        self, card_id: str, content: str, sequence: int,
+        element_id: str = _STREAM_ELEMENT_ID,
+    ) -> bool:
+        """Stream-update a markdown element on a CardKit card (typewriter effect)."""
         from lark_oapi.api.cardkit.v1 import (
             ContentCardElementRequest,
             ContentCardElementRequestBody,
@@ -1331,7 +1429,7 @@ class FeishuChannel(BaseChannel):
             request = (
                 ContentCardElementRequest.builder()
                 .card_id(card_id)
-                .element_id(_STREAM_ELEMENT_ID)
+                .element_id(element_id)
                 .request_body(
                     ContentCardElementRequestBody.builder()
                     .content(content)
@@ -1391,6 +1489,220 @@ class FeishuChannel(BaseChannel):
             self.logger.warning("Error closing streaming on card {}: {}", card_id, e)
             return False
 
+    def _stream_patch_element_sync(
+        self, card_id: str, element_id: str, partial: dict[str, Any], sequence: int
+    ) -> bool:
+        """Patch element properties on a CardKit card (e.g. collapse the process panel)."""
+        from lark_oapi.api.cardkit.v1 import PatchCardElementRequest, PatchCardElementRequestBody
+
+        try:
+            request = (
+                PatchCardElementRequest.builder()
+                .card_id(card_id)
+                .element_id(element_id)
+                .request_body(
+                    PatchCardElementRequestBody.builder()
+                    .partial_element(json.dumps(partial, ensure_ascii=False))
+                    .sequence(sequence)
+                    .uuid(str(uuid.uuid4()))
+                    .build()
+                )
+                .build()
+            )
+            response = self._client.cardkit.v1.card_element.patch(request)
+            if not response.success():
+                self.logger.warning(
+                    "Failed to patch card element {} on {}: code={}, msg={}",
+                    element_id, card_id, response.code, response.msg,
+                )
+                return False
+            return True
+        except Exception as e:
+            self.logger.warning("Error patching card element {} on {}: {}", element_id, card_id, e)
+            return False
+
+    async def send_reasoning_delta(
+        self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None
+    ) -> None:
+        """Stream model reasoning into the process panel (or legacy quote element).
+
+        Creates the streaming card on the first chunk so users see thinking
+        begin before any answer text. With the process panel enabled the card
+        carries a collapsible panel whose reasoning child streams live; rounds
+        after tool calls append behind a separator so the whole turn stays on
+        one card. Without a panel the legacy quote element above the content is
+        used. When reasoning arrives after a content-only card was already
+        created, the chunk degrades to an inline quote inside the content
+        element.
+        """
+        if not self._client or not self.supports_streaming or not delta:
+            return
+        meta = metadata or {}
+        stream_key = self._stream_key(chat_id, meta)
+        loop = asyncio.get_running_loop()
+        rid_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
+
+        buf = self._stream_bufs.get(stream_key)
+        if buf is None:
+            buf = _FeishuStreamBuf()
+            self._stream_bufs[stream_key] = buf
+        # New reasoning pass after a completed one (multi-round turn): divider.
+        if not buf.reasoning_open:
+            if buf.reasoning:
+                buf.reasoning += _ROUND_SEPARATOR
+                buf.reasoning_rounds += 1
+            elif not buf.reasoning_rounds:
+                buf.reasoning_rounds = 1
+        buf.reasoning_open = True
+        buf.reasoning += delta
+
+        now = time.monotonic()
+
+        # Card already exists without a reasoning element (content streamed
+        # first): degrade to an inline quote inside the content element.
+        if buf.card_id is not None and not buf.has_reasoning_element:
+            if not buf.reasoning_inlined:
+                buf.reasoning_inlined = True
+                buf.text += _format_reasoning_markdown(buf.reasoning, finished=False) + "\n"
+            else:
+                buf.text += _quote_reasoning_lines(buf.reasoning) + "\n"
+            buf.reasoning = ""
+            if (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL:
+                buf.sequence += 1
+                await loop.run_in_executor(
+                    None,
+                    self._stream_update_text_sync,
+                    buf.card_id, buf.text, buf.sequence, _STREAM_ELEMENT_ID,
+                )
+                buf.last_edit = now
+            return
+
+        # Panel mode renders the raw trace (no quote header — the panel
+        # provides the visual grouping); legacy mode keeps the quote header.
+        def _live_content() -> str:
+            if buf.has_tool_element:
+                return _tail_text(buf.reasoning, _REASONING_TAIL_CHARS)
+            return _format_reasoning_markdown(buf.reasoning, finished=False)
+
+        if buf.card_id is None:
+            use_panel = self.config.show_process_panel
+            use_reply_in_thread = self._should_use_reply_in_thread(meta)
+            reply_msg_id = self._thread_reply_target(meta)
+            card_id = await loop.run_in_executor(
+                None,
+                lambda: self._create_streaming_card_sync(
+                    rid_type,
+                    chat_id,
+                    reply_msg_id,
+                    reply_in_thread=use_reply_in_thread,
+                    with_process=use_panel,
+                    with_reasoning=not use_panel,
+                ),
+            )
+            if card_id:
+                buf.card_id = card_id
+                buf.has_reasoning_element = True
+                buf.has_tool_element = use_panel
+                buf.sequence = 1
+                await loop.run_in_executor(
+                    None,
+                    self._stream_update_text_sync,
+                    card_id, _live_content(), 1,
+                    _REASONING_ELEMENT_ID,
+                )
+                buf.last_reasoning_edit = now
+        elif (now - buf.last_reasoning_edit) >= self._STREAM_EDIT_INTERVAL:
+            buf.sequence += 1
+            await loop.run_in_executor(
+                None,
+                self._stream_update_text_sync,
+                buf.card_id,
+                _live_content(),
+                buf.sequence,
+                _REASONING_ELEMENT_ID,
+            )
+            buf.last_reasoning_edit = now
+
+    async def send_reasoning_end(
+        self, chat_id: str, metadata: dict[str, Any] | None = None
+    ) -> None:
+        """Freeze the reasoning trace with a "thought" header (or inline quote)."""
+        if not self._client:
+            return
+        meta = metadata or {}
+        stream_key = self._stream_key(chat_id, meta)
+        buf = self._stream_bufs.get(stream_key)
+        if buf is None or not buf.reasoning_open:
+            return
+        buf.reasoning_open = False
+        loop = asyncio.get_running_loop()
+
+        # Process-panel mode: the panel groups the trace visually and the
+        # collapsed summary header is applied when the whole turn finishes, so
+        # closing one reasoning pass needs no API call.
+        if buf.has_tool_element:
+            return
+
+        # Inline degradation path: reasoning was folded into the content text.
+        if not buf.has_reasoning_element or not buf.card_id:
+            if buf.card_id is not None and buf.reasoning_inlined:
+                # Flip the inline header to the finished variant and push.
+                buf.text = buf.text.replace(_REASONING_OPEN_HEADER, _REASONING_DONE_HEADER)
+                buf.sequence += 1
+                await loop.run_in_executor(
+                    None,
+                    self._stream_update_text_sync,
+                    buf.card_id, buf.text, buf.sequence, _STREAM_ELEMENT_ID,
+                )
+            buf.reasoning = ""
+            buf.reasoning_inlined = False
+            return
+
+        buf.sequence += 1
+        await loop.run_in_executor(
+            None,
+            self._stream_update_text_sync,
+            buf.card_id,
+            _format_reasoning_markdown(buf.reasoning, finished=True),
+            buf.sequence,
+            _REASONING_ELEMENT_ID,
+        )
+        buf.last_reasoning_edit = time.monotonic()
+
+    async def _collapse_process_panel(
+        self, loop: asyncio.AbstractEventLoop, buf: _FeishuStreamBuf
+    ) -> None:
+        """Collapse the process panel and stamp a summary header (turn finished).
+
+        The children are re-sent with final content so the panel is complete
+        even if a live streaming update failed along the way.
+        """
+        if not buf.card_id:
+            return
+        buf.reasoning_open = False
+        partial = {
+            "expanded": False,
+            "header": {
+                "title": {
+                    "tag": "markdown",
+                    "content": _process_summary_header(buf.reasoning_rounds, buf.tool_count),
+                },
+                "vertical_align": "center",
+            },
+            "elements": [
+                {"tag": "markdown", "element_id": _REASONING_ELEMENT_ID,
+                 "content": _tail_text(buf.reasoning, _REASONING_TAIL_CHARS)},
+                {"tag": "markdown", "element_id": _TOOL_ELEMENT_ID,
+                 "content": _tail_text(buf.tool_log, _TOOL_LOG_TAIL_CHARS)},
+            ],
+        }
+        buf.sequence += 1
+        await loop.run_in_executor(
+            None,
+            self._stream_patch_element_sync,
+            buf.card_id, _PROCESS_PANEL_ID, partial, buf.sequence,
+        )
+
     async def send_delta(
         self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None
     ) -> None:
@@ -1411,13 +1723,18 @@ class FeishuChannel(BaseChannel):
 
         # --- stream end: final update or fallback ---
         if meta.get("_stream_end"):
+            # Tool-round boundary: the agent keeps working. Keep the streaming
+            # card open so the next round continues on the SAME card instead
+            # of spawning a new one per round.
+            if meta.get("_resuming"):
+                buf = self._stream_bufs.get(stream_key)
+                if buf:
+                    buf.new_round = True
+                return
             message_id = meta.get("message_id")
             # Only finalize the OnIt -> DONE reaction transition on the truly
-            # final stream end. _resuming=True means the agent will keep
-            # working (more tool-call rounds), so leave the reaction state
-            # in place — otherwise the OnIt indicator disappears prematurely
-            # and the DONE reaction fires after every tool call.
-            if message_id and not meta.get("_resuming"):
+            # final stream end.
+            if message_id:
                 reaction_id = self._reaction_ids.pop(message_id, None)
                 if reaction_id:
                     await self._remove_reaction(message_id, reaction_id)
@@ -1426,7 +1743,34 @@ class FeishuChannel(BaseChannel):
                     await self._add_reaction(message_id, self.config.done_emoji)
 
             buf = self._stream_bufs.pop(stream_key, None)
-            if not buf or not buf.text:
+            if not buf:
+                return
+            if not buf.text:
+                # Reasoning-only stream (no answer text): freeze the reasoning
+                # element if still open, collapse the process panel, then exit
+                # streaming mode so the chat-list placeholder clears.
+                if buf.card_id:
+                    if buf.reasoning_open and buf.has_reasoning_element:
+                        buf.reasoning_open = False
+                        buf.sequence += 1
+                        if buf.has_tool_element:
+                            await self._collapse_process_panel(loop, buf)
+                        else:
+                            await loop.run_in_executor(
+                                None,
+                                self._stream_update_text_sync,
+                                buf.card_id,
+                                _format_reasoning_markdown(buf.reasoning, finished=True),
+                                buf.sequence,
+                                _REASONING_ELEMENT_ID,
+                            )
+                    buf.sequence += 1
+                    await loop.run_in_executor(
+                        None,
+                        self._close_streaming_mode_sync,
+                        buf.card_id,
+                        buf.sequence,
+                    )
                 return
             # Try to finalize via streaming card; if that fails (e.g.
             # streaming mode was closed by Feishu due to timeout), fall
@@ -1441,6 +1785,8 @@ class FeishuChannel(BaseChannel):
                     buf.sequence,
                 )
                 if ok:
+                    if buf.has_tool_element:
+                        await self._collapse_process_panel(loop, buf)
                     buf.sequence += 1
                     await loop.run_in_executor(
                         None,
@@ -1481,6 +1827,12 @@ class FeishuChannel(BaseChannel):
         if buf is None:
             buf = _FeishuStreamBuf()
             self._stream_bufs[stream_key] = buf
+        if buf.new_round:
+            # First content delta after a tool round: visually separate the
+            # text emitted by different rounds on the same card.
+            buf.new_round = False
+            if buf.text:
+                buf.text += _ROUND_SEPARATOR
         buf.text += delta
         if not buf.text.strip():
             return
@@ -1532,12 +1884,51 @@ class FeishuChannel(BaseChannel):
                 if not hint:
                     return
                 buf = self._stream_bufs.get(self._stream_key(msg.chat_id, msg.metadata))
+                if buf is not None and (buf.has_tool_element or (
+                    buf.card_id is None and self.config.show_process_panel
+                )):
+                    # Process-panel mode: append the hint to the tool log
+                    # element inside the collapsible panel, keeping the
+                    # answer text clean.
+                    if buf.card_id is None:
+                        card_id = await loop.run_in_executor(
+                            None,
+                            lambda: self._create_streaming_card_sync(
+                                receive_id_type,
+                                msg.chat_id,
+                                self._thread_reply_target(msg.metadata),
+                                reply_in_thread=self._should_use_reply_in_thread(msg.metadata),
+                                with_process=True,
+                            ),
+                        )
+                        if not card_id:
+                            return
+                        buf.card_id = card_id
+                        buf.has_reasoning_element = True
+                        buf.has_tool_element = True
+                        buf.sequence = 1
+                    if buf.tool_log:
+                        buf.tool_log += "\n\n"
+                    buf.tool_log += self._format_tool_hint_delta(hint)
+                    buf.tool_count += 1
+                    buf.sequence += 1
+                    await loop.run_in_executor(
+                        None,
+                        self._stream_update_text_sync,
+                        buf.card_id,
+                        _tail_text(buf.tool_log, _TOOL_LOG_TAIL_CHARS),
+                        buf.sequence,
+                        _TOOL_ELEMENT_ID,
+                    )
+                    return
                 if buf and buf.card_id:
-                    # Delegate to send_delta so tool hints get the same
-                    # throttling (and card creation) as regular text deltas.
+                    # Legacy streaming mode: delegate to send_delta so tool
+                    # hints get the same throttling (and card creation) as
+                    # regular text deltas.
                     await self.send_delta(
                         msg.chat_id,
                         "\n\n" + self._format_tool_hint_delta(hint) + "\n\n",
+                        metadata=msg.metadata,
                     )
                     return
                 # No active streaming card — send as a regular interactive card
