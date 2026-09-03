@@ -11,6 +11,7 @@ import pytest
 from nanobot.providers.transcription import (
     GroqTranscriptionProvider,
     OpenAITranscriptionProvider,
+    SiliconFlowTranscriptionProvider,
     _resolve_transcription_url,
 )
 
@@ -328,3 +329,83 @@ def test_groq_provider_normalizes_chat_style_api_base() -> None:
     """Regression for #3637: apiBase set to the v1 base resolves to the audio endpoint."""
     provider = GroqTranscriptionProvider(api_key="gsk-test", api_base="https://api.groq.com/openai/v1")
     assert provider.api_url == "https://api.groq.com/openai/v1/audio/transcriptions"
+
+
+# ---------------------------------------------------------------------------
+# SiliconFlow provider
+# ---------------------------------------------------------------------------
+
+
+def test_siliconflow_default_endpoint_and_model() -> None:
+    provider = SiliconFlowTranscriptionProvider(api_key="sf-test")
+    assert provider.api_url == "https://api.siliconflow.cn/v1/audio/transcriptions"
+    assert provider.model == "FunAudioLLM/SenseVoiceSmall"
+
+
+def test_siliconflow_custom_model_and_base() -> None:
+    provider = SiliconFlowTranscriptionProvider(
+        api_key="sf-test",
+        api_base="https://api.siliconflow.cn/v1",
+        model="XingChenAGI/XingChenASR-V3.2-Ultra",
+    )
+    assert provider.api_url == "https://api.siliconflow.cn/v1/audio/transcriptions"
+    assert provider.model == "XingChenAGI/XingChenASR-V3.2-Ultra"
+
+
+@pytest.mark.asyncio
+async def test_siliconflow_sends_configured_model(audio_file: Path) -> None:
+    provider = SiliconFlowTranscriptionProvider(
+        api_key="sf-test", model="XingChenAGI/XingChenASR-V3.2-Ultra"
+    )
+    post = AsyncMock(return_value=_response(200, {"text": "你好世界"}))
+    with patch("httpx.AsyncClient.post", post):
+        result = await provider.transcribe(audio_file)
+    assert result == "你好世界"
+    # Model must be sent as a multipart form field
+    files = post.call_args.kwargs.get("files") or post.call_args.args
+    assert any(
+        m == "XingChenAGI/XingChenASR-V3.2-Ultra"
+        for m in (v[1] for v in files.values() if isinstance(v, tuple) and len(v) == 2)
+    )
+
+
+@pytest.mark.asyncio
+async def test_siliconflow_without_key_returns_empty(audio_file: Path) -> None:
+    provider = SiliconFlowTranscriptionProvider(api_key=None)
+    assert await provider.transcribe(audio_file) == ""
+
+
+@pytest.mark.asyncio
+async def test_base_channel_routes_siliconflow(audio_file: Path) -> None:
+    """BaseChannel.transcribe_audio dispatches to the SiliconFlow provider."""
+    from unittest.mock import MagicMock
+
+    from nanobot.channels.base import BaseChannel
+
+    class _Stub(BaseChannel):
+        async def send(self, *a, **k):  # pragma: no cover - abstract stub
+            return True
+
+        async def start(self):  # pragma: no cover
+            pass
+
+        async def stop(self):  # pragma: no cover
+            pass
+
+    ch = _Stub.__new__(_Stub)
+    ch.transcription_provider = "siliconflow"
+    ch.transcription_api_key = "sf-test"
+    ch.transcription_api_base = ""
+    ch.transcription_language = None
+    ch.transcription_model = "XingChenAGI/XingChenASR-V3.2-Ultra"
+    ch.logger = MagicMock()
+
+    fake = MagicMock()
+    fake.transcribe = AsyncMock(return_value="转写文本")
+    with patch(
+        "nanobot.providers.transcription.SiliconFlowTranscriptionProvider",
+        return_value=fake,
+    ):
+        result = await ch.transcribe_audio(audio_file)
+
+    assert result == "转写文本"

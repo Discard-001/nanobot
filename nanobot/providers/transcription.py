@@ -219,3 +219,49 @@ class GroqTranscriptionProvider:
             provider_label="Groq",
             language=self.language,
         )
+
+
+class SiliconFlowTranscriptionProvider:
+    """Voice transcription provider using SiliconFlow's ASR models
+    (OpenAI-compatible /v1/audio/transcriptions endpoint).
+
+    Free models include FunAudioLLM/SenseVoiceSmall and
+    XingChenAGI/XingChenASR-V3.2-Ultra (zh/en + 60 dialects).
+    """
+
+    _DEFAULT_BASE = "https://api.siliconflow.cn/v1"
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        language: str | None = None,
+        model: str = "FunAudioLLM/SenseVoiceSmall",
+    ):
+        self.api_key = api_key or os.environ.get("SILICONFLOW_API_KEY")
+        base = api_base or os.environ.get("SILICONFLOW_BASE_URL") or self._DEFAULT_BASE
+        self.api_url = _resolve_transcription_url(
+            base, f"{self._DEFAULT_BASE}/audio/transcriptions"
+        )
+        self.language = language or None
+        self.model = model
+        logger.debug("SiliconFlow transcription endpoint: {} (model={})", self.api_url, model)
+
+    async def transcribe(self, file_path: str | Path) -> str:
+        if not self.api_key:
+            logger.warning("SiliconFlow API key not configured for transcription")
+            return ""
+
+        path = Path(file_path)
+        if not path.exists():
+            logger.error("Audio file not found: {}", file_path)
+            return ""
+
+        return await _post_transcription_with_retry(
+            self.api_url,
+            api_key=self.api_key,
+            path=path,
+            model=self.model,
+            provider_label="SiliconFlow",
+            language=self.language,
+        )

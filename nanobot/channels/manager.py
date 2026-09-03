@@ -79,9 +79,17 @@ class ChannelManager:
         from nanobot.channels.registry import discover_channel_names, discover_enabled
 
         transcription_provider = self.config.channels.transcription_provider
-        transcription_key = self._resolve_transcription_key(transcription_provider)
-        transcription_base = self._resolve_transcription_base(transcription_provider)
+        # Explicit overrides win over provider-derived credentials
+        transcription_key = (
+            self.config.channels.transcription_api_key
+            or self._resolve_transcription_key(transcription_provider)
+        )
+        transcription_base = (
+            self.config.channels.transcription_api_base
+            or self._resolve_transcription_base(transcription_provider)
+        )
         transcription_language = self.config.channels.transcription_language
+        transcription_model = self.config.channels.transcription_model
 
         # Collect enabled module names first, then only import those.
         # Channel configs live in ChannelsConfig's extra fields (via
@@ -127,6 +135,7 @@ class ChannelManager:
                 channel.transcription_api_key = transcription_key
                 channel.transcription_api_base = transcription_base
                 channel.transcription_language = transcription_language
+                channel.transcription_model = transcription_model
                 channel.send_progress = self._resolve_bool_override(
                     section, "send_progress", self.config.channels.send_progress,
                 )

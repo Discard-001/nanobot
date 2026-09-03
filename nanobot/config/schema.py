@@ -39,7 +39,18 @@ class ChannelsConfig(Base):
     show_reasoning: bool = True  # surface model reasoning when channel implements it
     extract_document_text: bool = True  # extract text from document attachments before sending to the model
     send_max_retries: int = Field(default=3, ge=0, le=10)  # Max delivery attempts (initial send included)
-    transcription_provider: str = "groq"  # Voice transcription backend: "groq" or "openai"
+    transcription_provider: str = "groq"  # Voice transcription backend: "groq", "openai", or "siliconflow"
+    # Optional overrides; when set they take precedence over provider-derived
+    # credentials (e.g. reuse the SiliconFlow key already used for RAG).
+    transcription_api_key: str = Field(
+        default="", validation_alias=AliasChoices("transcriptionApiKey", "transcription_api_key")
+    )
+    transcription_api_base: str = Field(
+        default="", validation_alias=AliasChoices("transcriptionApiBase", "transcription_api_base")
+    )
+    transcription_model: str = Field(
+        default="", validation_alias=AliasChoices("transcriptionModel", "transcription_model")
+    )  # e.g. XingChenAGI/XingChenASR-V3.2-Ultra (siliconflow)
     transcription_language: str | None = Field(default=None, pattern=r"^[a-z]{2,3}$")  # Optional ISO-639-1 hint for audio transcription
 
 
