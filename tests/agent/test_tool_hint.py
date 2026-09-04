@@ -1,7 +1,7 @@
 """Tests for tool hint formatting (nanobot.utils.tool_hints)."""
 
-from nanobot.utils.tool_hints import format_tool_hints
 from nanobot.providers.base import ToolCallRequest
+from nanobot.utils.tool_hints import format_tool_hints
 
 
 def _tc(name: str, args) -> ToolCallRequest:
@@ -207,6 +207,15 @@ class TestToolHintMultipleCalls:
 
 class TestToolHintEdgeCases:
     """Test edge cases and defensive handling (G1, G2)."""
+
+    def test_multiline_args_collapsed_to_single_line(self):
+        """Multi-line args (e.g. message tool content) must not leak newlines:
+        hints render inside inline code blocks / quote panels that cannot
+        span lines."""
+        content = "🌤️ 哈尔滨今天天气\n\n当前：晴 21°C\n\n全天晴朗，早晚注意添衣～" + "x" * 60
+        result = _hint([_tc("message", {"content": content})])
+        assert "\n" not in result
+        assert " " in result  # newlines became spaces, not dropped entirely
 
     def test_known_tool_empty_list_args(self):
         """C1/G1: Empty list arguments should not crash."""

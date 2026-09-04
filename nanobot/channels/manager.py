@@ -136,14 +136,18 @@ class ChannelManager:
                 channel.transcription_api_base = transcription_base
                 channel.transcription_language = transcription_language
                 channel.transcription_model = transcription_model
+                # Fall back to the channel's own class default (not the global
+                # ChannelsConfig default) so channels that opt in at class level
+                # (e.g. QQ's send_tool_hints=True) keep their default unless
+                # explicitly overridden in config.
                 channel.send_progress = self._resolve_bool_override(
-                    section, "send_progress", self.config.channels.send_progress,
+                    section, "send_progress", channel.send_progress,
                 )
                 channel.send_tool_hints = self._resolve_bool_override(
-                    section, "send_tool_hints", self.config.channels.send_tool_hints,
+                    section, "send_tool_hints", channel.send_tool_hints,
                 )
                 channel.show_reasoning = self._resolve_bool_override(
-                    section, "show_reasoning", self.config.channels.show_reasoning,
+                    section, "show_reasoning", channel.show_reasoning,
                 )
                 self.channels[name] = channel
                 logger.info("{} channel enabled", cls.display_name)

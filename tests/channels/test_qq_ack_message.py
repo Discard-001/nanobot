@@ -45,13 +45,18 @@ class _FakeClient:
 
 @pytest.mark.asyncio
 async def test_ack_sent_on_c2c_message() -> None:
-    """Ack is sent immediately for C2C messages, then normal processing continues."""
+    """Ack is sent immediately for C2C messages, then normal processing continues.
+
+    C2C streaming mode suppresses the ack (the stream is the feedback), so
+    these ack tests run with streaming disabled.
+    """
     channel = QQChannel(
         QQConfig(
             app_id="app",
             secret="secret",
             allow_from=["*"],
             ack_message="⏳ Processing...",
+            streaming=False,
         ),
         MessageBus(),
     )
@@ -151,6 +156,7 @@ async def test_custom_ack_message_text() -> None:
             secret="secret",
             allow_from=["*"],
             ack_message=custom,
+            streaming=False,
         ),
         MessageBus(),
     )

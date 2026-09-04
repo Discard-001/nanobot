@@ -52,9 +52,13 @@ def format_tool_hints(tool_calls: list, max_length: int = 40) -> str:
         else:
             hints.append((hint, 1))
 
-    return ", ".join(
+    joined = ", ".join(
         f"{h} \u00d7 {c}" if c > 1 else h for h, c in hints
     )
+    # Hints are single-line summaries rendered inside inline code blocks
+    # (QQ) and quote panels (Feishu/Telegram); multi-line args (e.g. the
+    # message tool's long content) must not leak newlines into them.
+    return " ".join(joined.split())
 
 
 def _get_args(tc) -> dict:
