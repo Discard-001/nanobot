@@ -774,14 +774,14 @@ class TestProcessPanel:
         assert panel["tag"] == "collapsible_panel"
         assert panel["expanded"] is True
         child_ids = [el["element_id"] for el in panel["elements"]]
-        assert child_ids == ["reasoning_md", "tool_md"]
-        # Panel mode streams the raw trace (no quote header)
+        assert child_ids == ["process_md"]
+        # Panel mode streams the open pass live on the timeline element
         update_req = ch._client.cardkit.v1.card_element.content.call_args[0][0]
-        assert update_req.element_id == "reasoning_md"
-        assert update_req.request_body.content == "step one"
+        assert update_req.element_id == "process_md"
+        assert "step one" in update_req.request_body.content
 
     @pytest.mark.asyncio
-    async def test_tool_hint_routed_to_panel_tool_element(self):
+    async def test_tool_hint_routed_to_panel_timeline(self):
         ch = _make_channel()
         ch._stream_bufs["om_in_1"] = _FeishuStreamBuf(
             card_id="card_1", sequence=2, has_reasoning_element=True,
@@ -798,10 +798,11 @@ class TestProcessPanel:
 
         buf = ch._stream_bufs["om_in_1"]
         assert buf.tool_count == 1
-        assert "web_search" in buf.tool_log
+        assert buf.timeline[-1][0] == "tool"
+        assert "web_search" in buf.timeline[-1][1]
         assert buf.text == ""  # answer text stays clean
         update_req = ch._client.cardkit.v1.card_element.content.call_args[0][0]
-        assert update_req.element_id == "tool_md"
+        assert update_req.element_id == "process_md"
         assert "web_search" in update_req.request_body.content
 
     @pytest.mark.asyncio
@@ -843,7 +844,7 @@ class TestProcessPanel:
         buf = ch._stream_bufs["om_in_9"]
         assert buf is not None and buf.card_id == "card_p3"
         assert buf.has_tool_element is True
-        assert "shell" in buf.tool_log
+        assert "shell" in buf.timeline[-1][1]
 
     @pytest.mark.asyncio
     async def test_reasoning_end_panel_pushes_full_trace(self):
@@ -861,9 +862,11 @@ class TestProcessPanel:
 
         buf = ch._stream_bufs["oc_chat1"]
         assert buf.reasoning_open is False
+        assert buf.reasoning == ""  # folded into the timeline
+        assert buf.timeline == [("reasoning", "完整思考内容")]
         update_req = ch._client.cardkit.v1.card_element.content.call_args[0][0]
-        assert update_req.element_id == "reasoning_md"
-        assert update_req.request_body.content == "完整思考内容"
+        assert update_req.element_id == "process_md"
+        assert "完整思考内容" in update_req.request_body.content
         assert buf.sequence == 3
 
     @pytest.mark.asyncio
@@ -883,7 +886,7 @@ class TestProcessPanel:
         await ch.send(msg)
 
         buf = ch._stream_bufs["om_in_1"]
-        assert buf.tool_log == ""  # legacy mode does not use the tool element
+        assert buf.timeline == []  # legacy mode does not use the timeline
         assert "shell" in buf.text
 
     @pytest.mark.asyncio
@@ -900,9 +903,54 @@ class TestProcessPanel:
 
         buf = ch._stream_bufs["oc_chat1"]
         assert buf.reasoning_rounds == 2
+        # Panel mode: the finished pass folds into the timeline; the new pass
+        # starts a fresh accumulator.
+        assert buf.timeline == [("reasoning", "round one")]
+        assert buf.reasoning == "round two"
+
+    @pytest.mark.asyncio
+    async def test_legacy_multi_round_reasoning_appends_separator(self):
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            reasoning="round one", card_id="card_1", sequence=2,
+            reasoning_open=False, has_reasoning_element=True,
+            has_tool_element=False, reasoning_rounds=1, last_reasoning_edit=0.0,
+        )
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+
+        await ch.send_reasoning_delta("oc_chat1", "round two")
+
+        buf = ch._stream_bufs["oc_chat1"]
+        assert buf.reasoning_rounds == 2
         assert "round one" in buf.reasoning
         assert "round two" in buf.reasoning
         assert "···" in buf.reasoning  # round separator present
+
+    @pytest.mark.asyncio
+    async def test_panel_timeline_interleaves_reasoning_and_tools(self):
+        """Thinking and tool calls must interleave chronologically in the panel."""
+        from nanobot.channels.feishu import _render_process_timeline
+
+        timeline = [
+            ("reasoning", "first pass"),
+            ("tool", "🔧 `web_search(query='a')`"),
+            ("reasoning", "second pass"),
+            ("tool", "🔧 `read_file(path='b')`"),
+            ("reasoning", "final pass"),
+        ]
+        rendered = _render_process_timeline(timeline, open_reasoning="closing thought")
+
+        # Arrival order preserved: reasoning → tool → reasoning → tool → reasoning
+        first_tool = rendered.index("web_search")
+        second_reasoning = rendered.index("second pass")
+        second_tool = rendered.index("read_file")
+        third_reasoning = rendered.index("final pass")
+        assert first_tool < second_reasoning < second_tool < third_reasoning
+        # Reasoning renders as quote blocks
+        assert "> first pass" in rendered
+        assert "> closing thought" in rendered
+        # Round dividers separate reasoning passes that follow other events
+        assert rendered.count("···") >= 3
 
     @pytest.mark.asyncio
     async def test_stream_end_collapses_panel_with_summary_header(self):
@@ -926,9 +974,10 @@ class TestProcessPanel:
         assert partial["expanded"] is False
         assert "思考 2 轮" in partial["header"]["title"]["content"]
         assert "工具 3 次" in partial["header"]["title"]["content"]
-        # Panel children are re-sent with final content
+        # Panel children are re-sent with final content (open pass folded
+        # into the timeline and rendered as a quote block)
         child_map = {el["element_id"]: el["content"] for el in partial["elements"]}
-        assert child_map["reasoning_md"] == "thoughts"
+        assert "thoughts" in child_map["process_md"]
         # Streaming mode closed after collapse (text update seq 4, patch seq 5, close seq 6)
         settings_req = ch._client.cardkit.v1.card.settings.call_args[0][0]
         assert settings_req.body.sequence == 6

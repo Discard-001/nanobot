@@ -43,7 +43,8 @@ class VideoGenerationToolConfig(Base):
     enabled: bool = False
     provider: str = "openai"
     model: str = "agnes-video-2.5-flash"
-    default_seconds: str = "5"
+    # Platform allows "4"-"12"; default to the minimum for fastest generation.
+    default_seconds: str = "4"
     # None = omit (let the API apply its default; agnes-video-2.5-flash only
     # accepts "720P", agnes-video-2.5 also accepts "2K")
     default_size: str | None = None
@@ -64,7 +65,8 @@ class VideoGenerationToolConfig(Base):
             min_length=1,
         ),
         seconds=StringSchema(
-            'Video duration as a string, e.g. "4" to "12".',
+            'Video duration as a string, "4" to "12" (platform minimum is 4). '
+            'Default "4" (fastest).',
         ),
         aspect_ratio=StringSchema(
             "Output aspect ratio: 21:9, 16:9, 4:3, 1:1, 3:4, 9:16.",

@@ -10,7 +10,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from lark_oapi.api.im.v1.model import MentionEvent, P2ImMessageReceiveV1
@@ -265,17 +265,18 @@ class FeishuConfig(Base):
 
 _STREAM_ELEMENT_ID = "streaming_md"
 _REASONING_ELEMENT_ID = "reasoning_md"
-_TOOL_ELEMENT_ID = "tool_md"
+_PROCESS_ELEMENT_ID = "process_md"
 _PROCESS_PANEL_ID = "process_panel"
 
 # Render only the tail of long reasoning traces so card element content stays
 # within CardKit size limits while still feeling "live".
 _REASONING_TAIL_CHARS = 1200
-_TOOL_LOG_TAIL_CHARS = 4000
+_PROCESS_TAIL_CHARS = 5000
 _REASONING_OPEN_HEADER = "💭 **深度思考中…**"
 _REASONING_DONE_HEADER = "💭 **已深度思考**"
 _PROCESS_PANEL_HEADER = "⚙️ **执行过程**"
 _ROUND_SEPARATOR = "\n\n**···**\n\n"
+_PROCESS_ROUND_DIVIDER = "**···**"
 
 
 def _process_summary_header(reasoning_rounds: int, tool_count: int) -> str:
@@ -291,11 +292,41 @@ def _process_summary_header(reasoning_rounds: int, tool_count: int) -> str:
     return f"{_PROCESS_PANEL_HEADER}{suffix}"
 
 
+def _render_process_timeline(
+    timeline: list[tuple[str, str]], open_reasoning: str = ""
+) -> str:
+    """Render process-panel events in arrival order.
+
+    Each entry is ``(kind, content)`` with kind ``"reasoning"`` (a completed
+    reasoning pass) or ``"tool"`` (a formatted tool hint). Reasoning passes
+    render as quote blocks, tool hints keep their 🔧 prefix; a new reasoning
+    round that follows earlier events is separated by a ··· divider so
+    interleaved turns stay readable.
+    """
+    parts: list[str] = []
+    prev_kind: str | None = None
+    for kind, content in timeline:
+        if not content.strip():
+            continue
+        if kind == "reasoning":
+            if prev_kind is not None:
+                parts.append(_PROCESS_ROUND_DIVIDER)
+            parts.append(_quote_reasoning_lines(content))
+        else:
+            parts.append(content)
+        prev_kind = kind
+    if open_reasoning.strip():
+        if prev_kind is not None:
+            parts.append(_PROCESS_ROUND_DIVIDER)
+        parts.append(_quote_reasoning_lines(open_reasoning))
+    return _tail_text("\n\n".join(parts), _PROCESS_TAIL_CHARS)
+
+
 def _process_panel_element(
     *, expanded: bool = True, header: str = _PROCESS_PANEL_HEADER,
-    reasoning: str = "", tool_log: str = "",
+    content: str = "",
 ) -> dict[str, Any]:
-    """Build the collapsible process panel element (reasoning + tool log)."""
+    """Build the collapsible process panel element (single timeline child)."""
     return {
         "tag": "collapsible_panel",
         "element_id": _PROCESS_PANEL_ID,
@@ -303,10 +334,8 @@ def _process_panel_element(
         "background_color": "grey",
         "header": {"title": {"tag": "markdown", "content": header}, "vertical_align": "center"},
         "elements": [
-            {"tag": "markdown", "element_id": _REASONING_ELEMENT_ID,
-             "content": _tail_text(reasoning, _REASONING_TAIL_CHARS)},
-            {"tag": "markdown", "element_id": _TOOL_ELEMENT_ID,
-             "content": _tail_text(tool_log, _TOOL_LOG_TAIL_CHARS)},
+            {"tag": "markdown", "element_id": _PROCESS_ELEMENT_ID,
+             "content": _tail_text(content, _PROCESS_TAIL_CHARS)},
         ],
     }
 
@@ -351,9 +380,15 @@ class _FeishuStreamBuf:
     last_reasoning_edit: float = 0.0
     has_reasoning_element: bool = False  # card was created with a reasoning element
     reasoning_inlined: bool = False  # degraded mode: header already in content text
-    # Process panel state (collapsible panel with reasoning + tool log).
+    # Process panel state (collapsible panel with a single timeline child).
+    # timeline holds (kind, content) events in arrival order — kind is
+    # "reasoning" (completed pass) or "tool" (formatted hint) — so thinking
+    # and tool calls interleave chronologically like the QQ stream view.
+    # In panel mode ``reasoning`` only accumulates the CURRENT pass and is
+    # folded into the timeline on reasoning_end; legacy (non-panel) mode keeps
+    # appending every pass into it with ··· dividers.
     reasoning_rounds: int = 0  # number of reasoning passes in this turn
-    tool_log: str = ""  # accumulated tool hints (panel mode)
+    timeline: list[tuple[str, str]] = field(default_factory=list)
     tool_count: int = 0
     has_tool_element: bool = False  # card was created with the process panel
     new_round: bool = False  # set on _resuming stream end; next delta adds a separator
@@ -1546,9 +1581,19 @@ class FeishuChannel(BaseChannel):
         if buf is None:
             buf = _FeishuStreamBuf()
             self._stream_bufs[stream_key] = buf
-        # New reasoning pass after a completed one (multi-round turn): divider.
+        # New reasoning pass after a completed one (multi-round turn).
         if not buf.reasoning_open:
-            if buf.reasoning:
+            if buf.has_tool_element:
+                # Panel mode: fold the previous pass into the timeline
+                # (defensive — reasoning_end normally does this) and start a
+                # fresh accumulator for the current pass.
+                if buf.reasoning:
+                    buf.timeline.append(("reasoning", buf.reasoning))
+                    buf.reasoning = ""
+                    buf.reasoning_rounds += 1
+                elif not buf.reasoning_rounds:
+                    buf.reasoning_rounds = 1
+            elif buf.reasoning:
                 buf.reasoning += _ROUND_SEPARATOR
                 buf.reasoning_rounds += 1
             elif not buf.reasoning_rounds:
@@ -1577,12 +1622,17 @@ class FeishuChannel(BaseChannel):
                 buf.last_edit = now
             return
 
-        # Panel mode renders the raw trace (no quote header — the panel
-        # provides the visual grouping); legacy mode keeps the quote header.
+        # Panel mode renders the chronological timeline (completed events +
+        # the open pass, no quote header — the panel provides the grouping);
+        # legacy mode keeps the quote header on a single trace.
         def _live_content() -> str:
             if buf.has_tool_element:
-                return _tail_text(buf.reasoning, _REASONING_TAIL_CHARS)
+                return _render_process_timeline(buf.timeline, buf.reasoning)
             return _format_reasoning_markdown(buf.reasoning, finished=False)
+
+        _live_element_id = (
+            _PROCESS_ELEMENT_ID if buf.has_tool_element else _REASONING_ELEMENT_ID
+        )
 
         if buf.card_id is None:
             use_panel = self.config.show_process_panel
@@ -1608,7 +1658,7 @@ class FeishuChannel(BaseChannel):
                     None,
                     self._stream_update_text_sync,
                     card_id, _live_content(), 1,
-                    _REASONING_ELEMENT_ID,
+                    _PROCESS_ELEMENT_ID if use_panel else _REASONING_ELEMENT_ID,
                 )
                 buf.last_reasoning_edit = now
         elif (now - buf.last_reasoning_edit) >= self._STREAM_EDIT_INTERVAL:
@@ -1619,7 +1669,7 @@ class FeishuChannel(BaseChannel):
                 buf.card_id,
                 _live_content(),
                 buf.sequence,
-                _REASONING_ELEMENT_ID,
+                _live_element_id,
             )
             buf.last_reasoning_edit = now
 
@@ -1639,18 +1689,22 @@ class FeishuChannel(BaseChannel):
 
         # Process-panel mode: gateways often deliver the whole reasoning trace
         # as a burst of deltas inside the throttle window, so the live path may
-        # have pushed only the first chunk. Push the complete pass now — this
-        # is the last chance to render it before the turn continues.
+        # have pushed only the first chunk. Fold the complete pass into the
+        # timeline and re-render — this is the last chance before the turn
+        # continues (tool call or answer).
         if buf.has_tool_element:
-            if buf.card_id and buf.reasoning:
+            if buf.reasoning:
+                buf.timeline.append(("reasoning", buf.reasoning))
+                buf.reasoning = ""
+            if buf.card_id and buf.timeline:
                 buf.sequence += 1
                 await loop.run_in_executor(
                     None,
                     self._stream_update_text_sync,
                     buf.card_id,
-                    _tail_text(buf.reasoning, _REASONING_TAIL_CHARS),
+                    _render_process_timeline(buf.timeline),
                     buf.sequence,
-                    _REASONING_ELEMENT_ID,
+                    _PROCESS_ELEMENT_ID,
                 )
                 buf.last_reasoning_edit = time.monotonic()
             return
@@ -1686,12 +1740,17 @@ class FeishuChannel(BaseChannel):
     ) -> None:
         """Collapse the process panel and stamp a summary header (turn finished).
 
-        The children are re-sent with final content so the panel is complete
-        even if a live streaming update failed along the way.
+        The timeline child is re-sent with final content so the panel is
+        complete even if a live streaming update failed along the way.
         """
         if not buf.card_id:
             return
         buf.reasoning_open = False
+        # Defensive fold: a reasoning-only stream may end without an explicit
+        # reasoning_end (e.g. aborted turn) — still render the open pass.
+        if buf.reasoning:
+            buf.timeline.append(("reasoning", buf.reasoning))
+            buf.reasoning = ""
         partial = {
             "expanded": False,
             "header": {
@@ -1702,10 +1761,8 @@ class FeishuChannel(BaseChannel):
                 "vertical_align": "center",
             },
             "elements": [
-                {"tag": "markdown", "element_id": _REASONING_ELEMENT_ID,
-                 "content": _tail_text(buf.reasoning, _REASONING_TAIL_CHARS)},
-                {"tag": "markdown", "element_id": _TOOL_ELEMENT_ID,
-                 "content": _tail_text(buf.tool_log, _TOOL_LOG_TAIL_CHARS)},
+                {"tag": "markdown", "element_id": _PROCESS_ELEMENT_ID,
+                 "content": _render_process_timeline(buf.timeline)},
             ],
         }
         buf.sequence += 1
@@ -1924,18 +1981,19 @@ class FeishuChannel(BaseChannel):
                         buf.has_reasoning_element = True
                         buf.has_tool_element = True
                         buf.sequence = 1
-                    if buf.tool_log:
-                        buf.tool_log += "\n\n"
-                    buf.tool_log += self._format_tool_hint_delta(hint)
+                    # Append the hint to the chronological timeline so tool
+                    # calls interleave with the reasoning passes that
+                    # surrounded them.
+                    buf.timeline.append(("tool", self._format_tool_hint_delta(hint)))
                     buf.tool_count += 1
                     buf.sequence += 1
                     await loop.run_in_executor(
                         None,
                         self._stream_update_text_sync,
                         buf.card_id,
-                        _tail_text(buf.tool_log, _TOOL_LOG_TAIL_CHARS),
+                        _render_process_timeline(buf.timeline),
                         buf.sequence,
-                        _TOOL_ELEMENT_ID,
+                        _PROCESS_ELEMENT_ID,
                     )
                     return
                 if buf and buf.card_id:
