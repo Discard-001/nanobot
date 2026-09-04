@@ -171,6 +171,68 @@ def detect_image_mime(data: bytes) -> str | None:
     return None
 
 
+_AUDIO_MAGIC_PREFIXES = [
+    (b"ID3", "audio/mpeg"),
+    (b"\xff\xfb", "audio/mpeg"),
+    (b"\xff\xf3", "audio/mpeg"),
+    (b"\xff\xf2", "audio/mpeg"),
+    (b"OggS", "audio/ogg"),
+    (b"fLaC", "audio/flac"),
+    (b"MAC ", "audio/ape"),
+]
+
+
+def detect_audio_mime(data: bytes, filename: str | None = None) -> str | None:
+    """Detect audio MIME type from magic bytes, falling back to extension."""
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "audio/wav"
+    if data[:4] == b"ftyp":
+        brand = data[8:12]
+        if brand.startswith(b"M4A"):
+            return "audio/mp4"
+        if brand.startswith(b"qt"):
+            return "video/quicktime"
+        return "audio/mp4"
+    for prefix, mime in _AUDIO_MAGIC_PREFIXES:
+        if data.startswith(prefix):
+            return mime
+    if filename:
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        return {
+            "mp3": "audio/mpeg",
+            "wav": "audio/wav",
+            "m4a": "audio/mp4",
+            "aac": "audio/aac",
+            "ogg": "audio/ogg",
+            "flac": "audio/flac",
+            "opus": "audio/ogg",
+        }.get(ext)
+    return None
+
+
+def detect_video_mime(data: bytes, filename: str | None = None) -> str | None:
+    """Detect video MIME type from magic bytes, falling back to extension."""
+    if data[:4] == b"ftyp":
+        brand = data[8:12]
+        if brand.startswith(b"qt"):
+            return "video/quicktime"
+        return "video/mp4"
+    if data[:4] == b"\x1aE\xdf\xa3":
+        return "video/webm" if (filename or "").lower().endswith(".webm") else "video/x-matroska"
+    if data[:3] == b"FLV":
+        return "video/x-flv"
+    if filename:
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        return {
+            "mp4": "video/mp4",
+            "m4v": "video/mp4",
+            "mov": "video/quicktime",
+            "webm": "video/webm",
+            "mkv": "video/x-matroska",
+        }.get(ext)
+    return None
+
+
 def build_image_content_blocks(
     raw: bytes, mime: str, path: str, label: str
 ) -> list[dict[str, Any]]:

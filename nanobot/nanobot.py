@@ -9,6 +9,7 @@ from typing import Any
 from nanobot.agent.hook import AgentHook, SDKCaptureHook
 from nanobot.agent.loop import AgentLoop
 from nanobot.providers.image_generation import image_gen_provider_configs
+from nanobot.providers.video_generation import video_gen_provider_configs
 
 
 @dataclass(slots=True)
@@ -65,6 +66,7 @@ class Nanobot:
         loop = AgentLoop.from_config(
             config,
             image_generation_provider_configs=image_gen_provider_configs(config),
+            video_generation_provider_configs=video_gen_provider_configs(config),
         )
         return cls(loop)
 

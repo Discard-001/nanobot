@@ -655,6 +655,7 @@ def serve(
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
     from nanobot.providers.image_generation import image_gen_provider_configs
+    from nanobot.providers.video_generation import video_gen_provider_configs
     from nanobot.session.manager import SessionManager
 
     if verbose:
@@ -675,6 +676,7 @@ def serve(
             runtime_config, bus,
             session_manager=session_manager,
             image_generation_provider_configs=image_gen_provider_configs(runtime_config),
+            video_generation_provider_configs=video_gen_provider_configs(runtime_config),
         )
     except ValueError as exc:
         console.print(f"[red]Error: {exc}[/red]")
