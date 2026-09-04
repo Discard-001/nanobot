@@ -889,6 +889,7 @@ def _run_gateway(
     from nanobot.cron.types import CronJob
     from nanobot.providers.factory import build_provider_snapshot, load_provider_snapshot
     from nanobot.providers.image_generation import image_gen_provider_configs
+    from nanobot.providers.video_generation import video_gen_provider_configs
     from nanobot.session.manager import SessionManager
 
     port = port if port is not None else config.gateway.port
@@ -920,6 +921,7 @@ def _run_gateway(
         cron_service=cron,
         session_manager=session_manager,
         image_generation_provider_configs=image_gen_provider_configs(config),
+        video_generation_provider_configs=video_gen_provider_configs(config),
         provider_snapshot_loader=load_provider_snapshot,
         runtime_model_publisher=lambda model, preset: publish_runtime_model_update(
             bus,
@@ -1306,6 +1308,7 @@ def agent(
     from nanobot.bus.queue import MessageBus
     from nanobot.cron.service import CronService
     from nanobot.providers.image_generation import image_gen_provider_configs
+    from nanobot.providers.video_generation import video_gen_provider_configs
 
     config = _load_runtime_config(config, workspace)
     sync_workspace_templates(config.workspace_path)
@@ -1330,6 +1333,7 @@ def agent(
             config, bus,
             cron_service=cron,
             image_generation_provider_configs=image_gen_provider_configs(config),
+            video_generation_provider_configs=video_gen_provider_configs(config),
         )
     except ValueError as exc:
         console.print(f"[red]Error: {exc}[/red]")

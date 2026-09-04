@@ -33,7 +33,9 @@ Describe in this order for stable results:
 ## Parameters
 
 - `seconds`: duration "4" to "12" (string). Platform minimum is 4; default "4" (fastest generation).
+
 - `aspect_ratio`: 21:9, 16:9, 4:3, 1:1, 3:4, 9:16.
+
 - Generation is slow (usually 1–5 minutes). While waiting is handled by the tool, tell the user upfront that video generation takes a while.
 
 ## Artifact Rules
