@@ -2030,6 +2030,19 @@ class FeishuChannel(BaseChannel):
                             "image",
                             json.dumps({"image_key": key}, ensure_ascii=False),
                         )
+                    else:
+                        # Upload failed (e.g. missing im:resource scope) — tell
+                        # the user instead of silently dropping the media.
+                        await loop.run_in_executor(
+                            None,
+                            _do_send,
+                            "text",
+                            json.dumps(
+                                {"text": f"[图片发送失败: {os.path.basename(file_path)}，"
+                                         f"请检查应用 im:resource 权限]"},
+                                ensure_ascii=False,
+                            ),
+                        )
                 else:
                     key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
                     if key:
@@ -2047,6 +2060,17 @@ class FeishuChannel(BaseChannel):
                             _do_send,
                             media_type,
                             json.dumps({"file_key": key}, ensure_ascii=False),
+                        )
+                    else:
+                        await loop.run_in_executor(
+                            None,
+                            _do_send,
+                            "text",
+                            json.dumps(
+                                {"text": f"[文件发送失败: {os.path.basename(file_path)}，"
+                                         f"请检查应用 im:resource 权限]"},
+                                ensure_ascii=False,
+                            ),
                         )
 
             if msg.content and msg.content.strip():
