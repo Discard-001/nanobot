@@ -1,7 +1,6 @@
 """Tests for FeishuChannel tool hint formatting."""
 
 import json
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -30,6 +29,10 @@ def mock_feishu_channel():
     config.encrypt_key = None
     config.verification_token = None
     config.tool_hint_prefix = "\U0001f527"  # 🔧
+    # These tests cover the legacy no-panel tool-hint path (separate
+    # interactive card). Panel-mode behavior is covered by
+    # tests/channels/test_feishu_streaming.py.
+    config.show_process_panel = False
     bus = MagicMock()
     channel = FeishuChannel(config, bus)
     channel._client = MagicMock()

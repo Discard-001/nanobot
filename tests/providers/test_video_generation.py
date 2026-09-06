@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 import pytest
 
+import nanobot.providers.video_generation as video_generation_module
 from nanobot.providers.video_generation import (
     OpenAIVideoGenerationClient,
     VideoGenerationError,
@@ -130,10 +131,11 @@ class TestGenerateFlow:
 
         monkeypatch.setattr(client, "_http_post", fake_post)
         monkeypatch.setattr(client, "_http_get", fake_get)
-        monkeypatch.setattr(
-            "nanobot.providers.video_generation.asyncio.sleep",
-            _no_sleep,
-        )
+        # Object-form patch: string targets like
+        # "nanobot.providers.video_generation.asyncio.sleep" break when an
+        # earlier test re-imports nanobot.providers and leaves the parent
+        # package attribute pointing at a fresh module object.
+        monkeypatch.setattr(video_generation_module.asyncio, "sleep", _no_sleep)
 
         response = await client.generate(
             prompt="a cat", model="agnes-video-2.5-flash", mode="text",
@@ -176,9 +178,7 @@ class TestGenerateFlow:
 
         monkeypatch.setattr(client, "_http_post", fake_post)
         monkeypatch.setattr(client, "_http_get", lambda url, **kw: _async(_resp(500)))
-        monkeypatch.setattr(
-            "nanobot.providers.video_generation.asyncio.sleep", _no_sleep
-        )
+        monkeypatch.setattr(video_generation_module.asyncio, "sleep", _no_sleep)
 
         response = await client.generate(
             prompt="p", model="m", mode="text", create_retries=3,
@@ -195,9 +195,7 @@ class TestGenerateFlow:
             return _resp(400, {"code": "invalid_request", "message": "size must be 720P"})
 
         monkeypatch.setattr(client, "_http_post", fake_post)
-        monkeypatch.setattr(
-            "nanobot.providers.video_generation.asyncio.sleep", _no_sleep
-        )
+        monkeypatch.setattr(video_generation_module.asyncio, "sleep", _no_sleep)
 
         with pytest.raises(VideoGenerationError, match="size must be 720P"):
             await client.generate(prompt="p", model="m", mode="text")
